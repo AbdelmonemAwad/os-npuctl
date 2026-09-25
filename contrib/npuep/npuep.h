@@ -41,6 +41,14 @@ struct npuep_facility {
 	 */
 	int		 first_msix;	/* index of this facility's first vector */
 	int		 nmsix;		/* how many it has */
+
+	/*
+	 * And, for the one facility that has to interrupt the target rather than be interrupted
+	 * by it: who owns the register window the doorbells live in, and which doorbell is this
+	 * facility's. Everything else here polls and leaves both unused.
+	 */
+	struct npuep_softc *parent;
+	int		 dbell;
 };
 
 /*
@@ -171,6 +179,14 @@ int	npuep_ring_dbell(struct npuep_softc *sc, int n);
 #define	RPC_CMD_LIF_DELETE	4
 #define	RPC_CMD_PPORT_UPDATE	5	/* bind a port tag to one: u8 iface, u8 rsvd, u16 tag */
 
+#define	RPC_DATA_MAX_SIZE	4096
+
+/*
+ * Thirty-six bits, and it is the device's limit rather than the bus's - see docs/mvmgmt.md. Every
+ * facility that hands the coprocessor a host address is bound by it.
+ */
+#define	NPUEP_DMA_LOWADDR	0xFFFFFFFFFULL
+
 int	npumgmt_attach(struct npuep_facility *fac);
 void	npumgmt_detach(void);
 
@@ -179,5 +195,8 @@ void	npugiu_detach(void);
 
 int	npunwa_attach(struct npuep_facility *fac);
 void	npunwa_detach(void);
+
+int	npurpc_attach(struct npuep_facility *fac);
+void	npurpc_detach(void);
 
 #endif /* _NPUEP_H_ */
