@@ -34,7 +34,16 @@ struct npuep_facility {
 	bus_dma_tag_t	 parent_tag;	/* parent for any DMA the consumer allocates */
 };
 
+/*
+ * The smallest giu window that can hold struct agnic_config_mem. Same rule as the mvmgmt
+ * minimum: the size came from the coprocessor, so it is checked where the map is read.
+ */
+#define	NPUEP_GIU_MIN_SIZE	0x400
+
 int	npumgmt_attach(struct npuep_facility *fac);
 void	npumgmt_detach(void);
+
+int	npugiu_attach(struct npuep_facility *fac);
+void	npugiu_detach(void);
 
 #endif /* _NPUEP_H_ */
