@@ -207,32 +207,101 @@ buffer pools and 2 management queues - so `AGNIC_MAX_QUEUES` is 386, and the ind
 bytes of BAR0 at `dev_use_size`. The default transmit ring is `AGNIC_DEFAULT_TXD = 2048`
 descriptors. `AGNIC_COOKIE_DRIVER_WATERMARK` is `0xdeaddead`.
 
-## The open question, and it is the whole point
+## How the fourteen ports are told apart
 
-**How the fourteen front ports are told apart.**
+**A two-byte port identifier prepended to every frame, in network order, in front of the Ethernet
+header.** Not the descriptor's `port_num` field, and not a VLAN tag.
 
-The receive descriptor has `port_num` at +0x08, and this host driver never reads it - there is no
-reference to the field anywhere in `giu_nic.c`. The driver registers exactly one netdev and
-treats the link as a single trunk, which matches the reference kit's behaviour and its MTU-1500,
-roughly-936-Mbps ceiling.
+`giu_nic.c` does not demultiplex at all. It includes `if_pport.h` and hands every received frame
+straight to another module, and the error path is what gives the format away - `giu_nic.c:1714`:
 
-The harvested port map shows the other half: `Port1`-`Port12` plus `PortF1`/`PortF2`, all children
-of `mv-pcimux0` on the coprocessor, **each with a VLAN 4095 subinterface**. VLAN 4095 is reserved
-in 802.1Q and cannot itself distinguish fourteen ports, so either the port identity is in
-`port_num` and the tag is a marker, or the coprocessor is configured to map each port to a
-different tag and 4095 is a default this capture happened to show.
+```c
+	if (unlikely(false == (pport_do_receive(skb)))) {
+		agnic_dev_warn("pport receive error port_id(0x%08x)\n",
+				ntohs(*(__be16 *)skb->data));
+```
 
-This cannot be settled from the host driver, because the host driver does not participate. It has
-to come from the coprocessor side - `mv_nwa_host` and the NPU's own configuration - and that is
-the next thing to read. Until it is settled, an implementation can carry traffic on one trunk but
-cannot present fourteen interfaces, and presenting fourteen is the point of the exercise.
+`skb->data` is the start of the received frame and the driver reads a `__be16` from it and calls
+it `port_id`. The `port_num` field in the receive descriptor is never read: there is no reference
+to it anywhere in `giu_nic.c`.
+
+### pport
+
+The module on the other side of that call is `mv_pport`, and it is an ordinary rtnetlink link
+type stacked on a real device - `alias: rtnl-link-pport`, exactly the shape of the VLAN driver.
+Fourteen `pport` netdevs sit on the one GIU trunk. It is GPL, its source is not in the drop, but
+the module is on the appliance and its interface is legible from it:
+
+```
+exported   pport_do_receive          the receive hook giu_nic calls
+           register_pport_device     create one
+           pport_get_port_info
+           pport_dev_pport_id
+           pport_link_ops            the rtnl link ops
+           cust_set_ops              where the per-port hardware operations get registered
+imported   skb_push                  transmit prepends
+           dev_queue_xmit            and hands the tagged frame to the real device
+           eth_type_trans            receive re-parses after stripping
+```
+
+`pport_%.4x` as a name format, and `PPORT_NAME_TYPE_PLUS_PORT_ID` as a naming mode, put the width
+beyond doubt: sixteen bits.
+
+So the datapath both ways is:
+
+```
+transmit   skb_push(skb, 2); *(__be16 *)skb->data = htons(port_id); dev_queue_xmit(real_dev)
+receive    port_id = ntohs(*(__be16 *)skb->data); skb_pull(skb, 2); eth_type_trans(...)
+```
+
+The receive half is proven by the code above. The transmit half is inferred from `skb_push`,
+`dev_queue_xmit` and the symmetry the receive half forces - it has not been read out of the
+disassembly, and a first implementation should confirm it with a capture rather than trust it.
+
+### And VLAN 4095 is not it
+
+An earlier reading of the harvested port map took the VLAN 4095 subinterface present on every
+port to be the discriminator. It is not: 4095 is reserved in 802.1Q, it is the same on all
+fourteen, and it therefore cannot distinguish them. Whatever that subinterface is for, the port
+identity is the two-byte tag.
+
+### What is still not published
+
+Per-port **control** - link state, speed, duplex, MTU, MAC address, promiscuous mode,
+statistics - does not ride the tag. `mv_pport` exposes `cust_set_ops` so that another module can
+register a `struct pport_hw_ops`, every entry of which takes a `u16 port_id`:
+
+```c
+struct pport_hw_ops {
+	int (*state_set)(u16 port_id, int state);
+	int (*state_get)(u16 port_id, bool *state);
+	int (*cached_state_get)(u16 port_id, bool *state);
+	int (*mtu_set)(u16 port_id, u32 mtu);
+	...
+};
+```
+
+That module is `mv_nwa_host`, Sophos's NetAgent, and it reaches the coprocessor over the AGNIC
+command channel as a `CDT_CUSTOM` client. The transport is published - `giu_custom_mgmt.c` is
+`agnic_register_custom()` and `agnic_send_custom_msg()`, a generic pipe with a callback. The
+message set that rides it is not: `mv_gnic_custom_mgmt.h` is included by that file and is absent
+from the drop, and `mv_nwa_host` is a binary.
+
+**This splits the work cleanly.** Fourteen interfaces that carry traffic need only the trunk and
+the two-byte tag, both of which are specified here. Fourteen interfaces whose link state, speed
+and MTU can be read and set need the NetAgent message set, which has to be recovered from
+`mv_nwa_host` the way the MCP2210 command map was recovered from `xgs-usb-spi-flash`. The first is
+worth having on its own; the second is a separate piece of work.
 
 ## Also still open
 
-- Whether the four `giu` doorbells are live, or dead the way the mvmgmt one is. pcinet forced
-  `dbell_nr = 0` on both paths and polled instead; nothing yet shows whether AGNIC does the same,
-  and it matters because `CC_PF_INGRESS_DATA_Q_ADD` carries an `msix_id` per queue, which suggests
-  it does not.
+- ~~Whether the four `giu` doorbells are live.~~ **They are.** `mv_giu_drv` takes a module
+  parameter `msix_mode` - "MSI-X Mode (Disabled=0, Rx=1, Tx=2, Rx & Tx=3)" - so unlike pcinet,
+  which forces `dbell_nr = 0` and polls, this facility does real interrupts and they can be
+  turned off per direction. Its other parameters are worth knowing before implementing: `num_tcs`,
+  `num_qs_per_tc` ("2 and above means RSS is enable"), `rss_mode` (2-tuple or 5-tuple),
+  `default_queue` for non-IP frames, `cpu_mask`, and `feature_enable` whose bit 0 is keep-alive.
+  Sophos loads it with `num_qs_per_tc=4`.
 - Whether the coprocessor's side agrees with the host's idea of how many queues exist. The host
   reserves for the maximum; what the device actually accepts at `CC_PF_INIT` is untested.
 - Whether scatter-gather is worth implementing. `CC_GET_CAPABILITIES` reports a `CAPABILITIES_SG`
