@@ -84,6 +84,14 @@ struct npunwa_port {
 	int		up;		/* we commanded it up */
 };
 
+/* What one transaction found, handed back to whoever asked for it. */
+struct npunwa_xfer_info {
+	uint32_t	rb;		/* window offset the reply was read from */
+	uint32_t	marker;
+	uint32_t	status;
+	uint32_t	replylen;	/* bytes, as the far side reported */
+};
+
 struct npunwa_softc {
 	struct npuep_facility	 fac;
 	struct mtx		 mtx;
@@ -109,6 +117,18 @@ struct npunwa_softc {
 	int			 ready;		/* the mailbox has been found and validated */
 	int			 busy;		/* a transaction is in the window */
 	int			 sweep;		/* which port the link poll looks at next */
+
+	/* the probe: the last raw request issued by hand, and what came back */
+	uint32_t		 probe_req[NWA_RAW_MAX_REQ_WORDS];
+	int			 probe_nreq;
+	uint32_t		 probe_reply[NWA_RAW_MAX_REPLY_WORDS];
+	int			 probe_len;	/* bytes, as the far side reported */
+	int			 probe_err;
+
+	struct npunwa_xfer_info	 probe_info;	/* where the probe's reply was, and what was there */
+
+	uint32_t		 dump_off;	/* what the window reader is looking at */
+	int			 dump_words;
 	uint32_t		 body;		/* NWA_BODY_OFF's value, also the gate */
 	uint32_t		 max_req;
 	struct npunwa_port	 port[NWA_LAST_PORT + 1];
@@ -166,21 +186,34 @@ nwa_wait(struct npunwa_softc *sc, bus_size_t off, uint32_t want, int ticks)
 }
 
 /*
- * One transaction. The order is the protocol, so it is written out plainly rather than
- * decomposed: wait for idle, length, body, signal, wait for the reply, read it, acknowledge.
+ * One transaction, with the request body given as raw words.
  *
- * `reply` may be NULL. Its first two words are the marker and the status and are checked here, so
- * a caller receives only payload.
+ * The order is the protocol, so it is written out plainly rather than decomposed: wait for idle,
+ * length, body, signal, wait for the reply, read it, acknowledge. `reply` may be NULL; its first
+ * two words are the marker and the status and are checked here, so a caller receives only
+ * payload.
+ *
+ * Everything about the protocol lives here; npunwa_transact() below is this with the four fields
+ * it knows about filled in. The raw form exists because the vendor's host sends requests this one
+ * does not yet understand - a status poll with words in places our four-field view has no name
+ * for - and reproducing those exactly is the only way to learn what they return.
+ *
+ * reqlen is written UNROUNDED at NWA_REQ_LEN, and the reply is read at body + reqlen, because
+ * that is where the far side puts it. Getting this wrong reads the tail of our own request back
+ * and calls it an answer.
  */
 static int
-npunwa_transact(struct npunwa_softc *sc, uint32_t op, uint32_t sub, uint32_t port,
-    uint32_t payload, uint32_t *reply, int nreply)
+npunwa_xfer(struct npunwa_softc *sc, const uint32_t *req, int nreq, uint32_t *reply, int nreply,
+    struct npunwa_xfer_info *info)
 {
 	bus_size_t rb;
 	uint32_t marker, status;
-	int err, i;
+	int err, i, reqlen = nreq * 4;
 
 	mtx_assert(&sc->mtx, MA_OWNED);
+
+	if (nreq <= 0 || reqlen > (int)sc->max_req)
+		return (EINVAL);
 
 	err = nwa_wait(sc, NWA_STATUS, NWA_STATUS_IDLE, NPUNWA_IDLE_WAIT);
 	if (err != 0) {
@@ -193,14 +226,10 @@ npunwa_transact(struct npunwa_softc *sc, uint32_t op, uint32_t sub, uint32_t por
 		return (err);
 	}
 
-	for (i = 0; i < NWA_REQ_SIZE; i += 4)
-		nwa_wr(sc, sc->body + i, 0);
-	nwa_wr(sc, sc->body + NWA_RQ_OP, op);
-	nwa_wr(sc, sc->body + NWA_RQ_SUB, sub);
-	nwa_wr(sc, sc->body + NWA_RQ_PORT, port);
-	nwa_wr(sc, sc->body + NWA_RQ_PAYLOAD, payload);
+	for (i = 0; i < nreq; i++)
+		nwa_wr(sc, sc->body + i * 4, req[i]);
 
-	nwa_wr(sc, NWA_REQ_LEN, NWA_REQ_SIZE);
+	nwa_wr(sc, NWA_REQ_LEN, (uint32_t)reqlen);
 	nwa_barrier(sc);
 	nwa_wr(sc, NWA_TURN, NWA_TURN_REQUEST);		/* last, and it is the signal */
 	nwa_barrier(sc);
@@ -215,9 +244,23 @@ npunwa_transact(struct npunwa_softc *sc, uint32_t op, uint32_t sub, uint32_t por
 	nwa_barrier(sc);
 
 	/* The reply follows the request at the UNROUNDED request length. */
-	rb = sc->body + NWA_REQ_SIZE;
+	rb = sc->body + reqlen;
 	marker = nwa_rd(sc, rb + NWA_RP_MARKER);
 	status = nwa_rd(sc, rb + NWA_RP_STATUS);
+
+	/*
+	 * Hand back where we looked and what was there, if the caller wants it. This used to be
+	 * written into the softc, which meant the link poll overwrote it between a probe issuing a
+	 * request and anyone reading the answer - so the probe reported another transaction's
+	 * offsets as its own. Shared scratch space for per-call results is a way to measure the
+	 * wrong thing and believe it.
+	 */
+	if (info != NULL) {
+		info->rb = (uint32_t)rb;
+		info->marker = marker;
+		info->status = status;
+		info->replylen = nwa_rd(sc, NWA_REPLY_LEN);
+	}
 
 	if (reply != NULL) {
 		for (i = 0; i < nreply; i++)
@@ -239,6 +282,24 @@ npunwa_transact(struct npunwa_softc *sc, uint32_t op, uint32_t sub, uint32_t por
 		return (EIO);
 	}
 	return (0);
+}
+
+/*
+ * The four-field request this driver actually uses, which is the raw one with a fixed shape.
+ */
+static int
+npunwa_transact(struct npunwa_softc *sc, uint32_t op, uint32_t sub, uint32_t port,
+    uint32_t payload, uint32_t *reply, int nreply)
+{
+	uint32_t req[NWA_REQ_SIZE / 4];
+
+	memset(req, 0, sizeof(req));
+	req[NWA_RQ_OP / 4] = op;
+	req[NWA_RQ_SUB / 4] = sub;
+	req[NWA_RQ_PORT / 4] = port;
+	req[NWA_RQ_PAYLOAD / 4] = payload;
+
+	return (npunwa_xfer(sc, req, NWA_REQ_SIZE / 4, reply, nreply, NULL));
 }
 
 /*
@@ -363,6 +424,231 @@ npunwa_link_step(struct npunwa_softc *sc)
 }
 
 /*
+ * A request written by hand, for finding out what this mailbox can be asked.
+ *
+ * The vendor's host polls the network agent with a request our four-field view has no names for:
+ * operation 0x45, sub-operation 0x10, and words in body positions this driver never writes. The
+ * reply is large and full of numbers that climb, which is what per-port packet counters look
+ * like. There is no way to confirm that except to send the same request and read the answer, and
+ * no way to send it except to be able to write an arbitrary body.
+ *
+ *	sysctl dev.npuep.0.nwa.probe="45 10 0 0 0 1 0 2"
+ *	sysctl -n dev.npuep.0.nwa.probe
+ *
+ * Reading operations only. This refuses SET, because a probe that can reconfigure ports by
+ * mistyping one word is not a probe, it is a hazard - the fourteen front ports are downstream of
+ * it. Widening that is a deliberate act for another day.
+ */
+static int
+npunwa_sysctl_probe(SYSCTL_HANDLER_ARGS)
+{
+	struct npunwa_softc *sc = arg1;
+	uint32_t rq[NWA_RAW_MAX_REQ_WORDS];
+	char in[160], *p, *end;
+	char *out;
+	int err, i, n = 0, words, shown;
+
+	/*
+	 * Out of line, not on the stack. A thousand words of hex is ten kilobytes and a kernel
+	 * stack is sixteen; putting this in an automatic would work right up until it did not.
+	 */
+#define	NPUNWA_PROBE_OUT	(NWA_RAW_MAX_REPLY_WORDS * 10 + 128)
+
+	/* A read reports the last exchange. */
+	if (req->newptr == NULL)
+		goto report;
+
+	in[0] = '\0';
+	err = sysctl_handle_string(oidp, in, sizeof(in), req);
+	if (err != 0)
+		return (err);
+
+	memset(rq, 0, sizeof(rq));
+	for (p = in; *p != '\0' && n < NWA_RAW_MAX_REQ_WORDS; ) {
+		while (*p == ' ' || *p == '\t' || *p == ',')
+			p++;
+		if (*p == '\0')
+			break;
+		rq[n++] = (uint32_t)strtoul(p, &end, 16);
+		if (end == p)
+			return (EINVAL);
+		p = end;
+	}
+	if (n == 0)
+		return (EINVAL);
+
+	if (rq[NWA_RQ_OP / 4] == NWA_OP_SET) {
+		device_printf(sc->fac.dev,
+		    "nwa: the probe will not issue SET - it is for reading\n");
+		return (EPERM);
+	}
+
+	mtx_lock(&sc->mtx);
+	if (!sc->ready || sc->body == 0) {
+		mtx_unlock(&sc->mtx);
+		return (ENXIO);
+	}
+	memcpy(sc->probe_req, rq, sizeof(rq));
+	sc->probe_nreq = n;
+	sc->probe_len = 0;
+	memset(sc->probe_reply, 0, sizeof(sc->probe_reply));
+	memset(&sc->probe_info, 0, sizeof(sc->probe_info));
+	sc->probe_err = npunwa_xfer(sc, rq, n, sc->probe_reply, NWA_RAW_MAX_REPLY_WORDS,
+	    &sc->probe_info);
+	sc->probe_len = (int)sc->probe_info.replylen;
+	mtx_unlock(&sc->mtx);
+
+	return (0);
+
+report:
+	if (sc->probe_nreq == 0)
+		return (sysctl_handle_string(oidp, "", 1, req));
+
+	out = malloc(NPUNWA_PROBE_OUT, M_DEVBUF, M_WAITOK);
+
+	n = snprintf(out, NPUNWA_PROBE_OUT, "sent");
+	for (i = 0; i < sc->probe_nreq; i++)
+		n += snprintf(out + n, NPUNWA_PROBE_OUT - n, " %x", sc->probe_req[i]);
+	n += snprintf(out + n, NPUNWA_PROBE_OUT - n, "\n");
+
+	if (sc->probe_err != 0) {
+		snprintf(out + n, NPUNWA_PROBE_OUT - n,
+		    "refused (%d) - looked at window +0x%x, found marker %08x status %08x, "
+		    "the agent reported %u bytes", sc->probe_err, sc->probe_info.rb,
+		    sc->probe_info.marker, sc->probe_info.status, sc->probe_info.replylen);
+		err = sysctl_handle_string(oidp, out, NPUNWA_PROBE_OUT, req);
+		free(out, M_DEVBUF);
+		return (err);
+	}
+
+	/*
+	 * The far side reports a reply length; trust it for how much to show, but never past what
+	 * was actually read into the buffer.
+	 */
+	words = sc->probe_len / 4;
+	if (words > NWA_RAW_MAX_REPLY_WORDS)
+		words = NWA_RAW_MAX_REPLY_WORDS;
+	shown = words;
+
+	n += snprintf(out + n, NPUNWA_PROBE_OUT - n,
+	    "reply %d bytes at window +0x%x (marker %08x status %08x), %d of %d words:",
+	    sc->probe_len, sc->probe_info.rb, sc->probe_info.marker, sc->probe_info.status,
+	    shown, sc->probe_len / 4);
+	for (i = 0; i < shown && n < NPUNWA_PROBE_OUT - 16; i++)
+		n += snprintf(out + n, NPUNWA_PROBE_OUT - n, "%s%08x",
+		    (i % 8) == 0 ? "\n  " : " ", sc->probe_reply[i]);
+
+	err = sysctl_handle_string(oidp, out, NPUNWA_PROBE_OUT, req);
+	free(out, M_DEVBUF);
+	return (err);
+#undef NPUNWA_PROBE_OUT
+}
+
+/*
+ * Read the window itself, in words, from wherever you say.
+ *
+ * The probe above reads the reply where the protocol says the reply is - at the body plus the
+ * unrounded request length - and reports what the far side put in the length register. When those
+ * two disagree with each other, or with what a request of a different length returned a minute
+ * earlier, the only way forward is to stop reasoning about where the answer should be and go and
+ * look at the window.
+ *
+ *	sysctl dev.npuep.0.nwa.dump="34 40"    forty words from window offset 0x34
+ *
+ * Both numbers are hex. Reading is harmless: this is the coprocessor's published window and the
+ * host reads most of it on every transaction anyway.
+ */
+static int
+npunwa_sysctl_dump(SYSCTL_HANDLER_ARGS)
+{
+	struct npunwa_softc *sc = arg1;
+	char in[64], *p, *end, *out;
+	uint32_t v[NWA_RAW_MAX_REPLY_WORDS];
+	u_long off, words;
+	int err, i, n = 0;
+
+	if (req->newptr != NULL) {
+		in[0] = '\0';
+		err = sysctl_handle_string(oidp, in, sizeof(in), req);
+		if (err != 0)
+			return (err);
+
+		p = in;
+		off = strtoul(p, &end, 16);
+		if (end == p)
+			return (EINVAL);
+		p = end;
+		while (*p == ' ' || *p == '\t' || *p == ',')
+			p++;
+		words = strtoul(p, &end, 16);
+		if (end == p || words == 0)
+			words = 16;
+		if (words > NWA_RAW_MAX_REPLY_WORDS)
+			words = NWA_RAW_MAX_REPLY_WORDS;
+		if ((off & 3) != 0 || off + words * 4 > (u_long)sc->fac.size)
+			return (EINVAL);
+
+		mtx_lock(&sc->mtx);
+		sc->dump_off = (uint32_t)off;
+		sc->dump_words = (int)words;
+		mtx_unlock(&sc->mtx);
+		return (0);
+	}
+
+	if (sc->dump_words == 0)
+		return (sysctl_handle_string(oidp, "", 1, req));
+
+	mtx_lock(&sc->mtx);
+	for (i = 0; i < sc->dump_words; i++)
+		v[i] = nwa_rd(sc, sc->dump_off + i * 4);
+	words = sc->dump_words;
+	off = sc->dump_off;
+	mtx_unlock(&sc->mtx);
+
+#define	NPUNWA_DUMP_OUT	(NWA_RAW_MAX_REPLY_WORDS * 10 + 128)
+	out = malloc(NPUNWA_DUMP_OUT, M_DEVBUF, M_WAITOK);
+	n = snprintf(out, NPUNWA_DUMP_OUT, "window +0x%lx, %lu words:", off, words);
+	for (i = 0; i < (int)words && n < NPUNWA_DUMP_OUT - 16; i++)
+		n += snprintf(out + n, NPUNWA_DUMP_OUT - n, "%s%08x",
+		    (i % 8) == 0 ? "\n  " : " ", v[i]);
+
+	err = sysctl_handle_string(oidp, out, NPUNWA_DUMP_OUT, req);
+	free(out, M_DEVBUF);
+	return (err);
+#undef NPUNWA_DUMP_OUT
+}
+
+static void
+npunwa_add_sysctls(struct npunwa_softc *sc)
+{
+	struct sysctl_ctx_list *ctx = device_get_sysctl_ctx(sc->fac.dev);
+	struct sysctl_oid *tree = device_get_sysctl_tree(sc->fac.dev);
+	struct sysctl_oid_list *child = SYSCTL_CHILDREN(tree);
+	struct sysctl_oid *node;
+
+	node = SYSCTL_ADD_NODE(ctx, child, OID_AUTO, "nwa", CTLFLAG_RD | CTLFLAG_MPSAFE, NULL,
+	    "the network agent, which owns the front ports");
+	if (node == NULL)
+		return;
+	child = SYSCTL_CHILDREN(node);
+
+	SYSCTL_ADD_U64(ctx, child, OID_AUTO, "commands", CTLFLAG_RD, &sc->commands, 0,
+	    "mailbox transactions completed");
+	SYSCTL_ADD_U64(ctx, child, OID_AUTO, "failures", CTLFLAG_RD, &sc->failures, 0,
+	    "transactions the agent refused or answered malformed");
+	SYSCTL_ADD_U64(ctx, child, OID_AUTO, "timeouts", CTLFLAG_RD, &sc->timeouts, 0,
+	    "transactions the agent never answered");
+	SYSCTL_ADD_INT(ctx, child, OID_AUTO, "ready", CTLFLAG_RD, &sc->ready, 0,
+	    "the mailbox has been found and validated");
+	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "probe",
+	    CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0, npunwa_sysctl_probe, "A",
+	    "write a request as hex words, read back what the agent answered");
+	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "dump",
+	    CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0, npunwa_sysctl_dump, "A",
+	    "write \"offset words\" in hex, read back that part of the window");
+}
+
+/*
  * Poll for the far side, then do the whole of the once-only setup and stop.
  *
  * Everything here reads a value the coprocessor published, so it all belongs on this side of the
@@ -416,6 +702,8 @@ npunwa_ready_step(struct npunwa_softc *sc)
 	device_printf(sc->fac.dev,
 	    "nwa: mailbox ready after %d ms, body at +0x%x, requests up to %u bytes\n",
 	    sc->tries * (1000 / 2), sc->body, sc->max_req);
+
+	npunwa_add_sysctls(sc);
 
 	npunwa_bring_up(sc);
 

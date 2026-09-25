@@ -214,6 +214,14 @@ struct npugiu_softc {
 	struct npugiu_buf	*buf;		/* receive buffers, handed to the pool */
 	struct npugiu_buf	*txbuf;		/* transmit buffers, one per descriptor */
 	int			 nbuf;
+	/*
+	 * And its own count, which is NOT nbuf. There are four receive pools and one transmit
+	 * ring, so the two arrays have different lengths - freeing the shorter one with the
+	 * longer one's bound walks off the end into whatever follows and hands
+	 * bus_dmamap_unload() a pointer that is not a map. That is a general protection fault on
+	 * unload, and it is how this comment came to be written.
+	 */
+	int			 ntxbuf;
 	int			 datapath;	/* the bring-up sequence completed */
 
 	if_t			 ifp;
@@ -1114,7 +1122,7 @@ npugiu_free_buffers(struct npugiu_softc *sc)
 		sc->buf = NULL;
 	}
 	if (sc->txbuf != NULL) {
-		for (i = 0; i < sc->nbuf; i++) {
+		for (i = 0; i < sc->ntxbuf; i++) {
 			if (sc->txbuf[i].vaddr == NULL)
 				continue;
 			bus_dmamap_unload(sc->buf_tag, sc->txbuf[i].map);
@@ -1124,6 +1132,7 @@ npugiu_free_buffers(struct npugiu_softc *sc)
 		free(sc->txbuf, M_DEVBUF);
 		sc->txbuf = NULL;
 	}
+	sc->ntxbuf = 0;
 	if (sc->buf_tag != NULL) {
 		bus_dma_tag_destroy(sc->buf_tag);
 		sc->buf_tag = NULL;
@@ -1167,6 +1176,7 @@ npugiu_alloc_txbuffers(struct npugiu_softc *sc, int n)
 	int i, err;
 
 	sc->txbuf = malloc(sizeof(*sc->txbuf) * n, M_DEVBUF, M_WAITOK | M_ZERO);
+	sc->ntxbuf = n;
 
 	for (i = 0; i < n; i++) {
 		bus_addr_t pa = 0;
