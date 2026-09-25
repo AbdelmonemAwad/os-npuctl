@@ -49,6 +49,9 @@
 #define	NPURPC_HI_DESC_OFF	0x2000
 #define	NPURPC_HI_DESC_COUNT	32
 
+/* How much of a hand-written command, and of its answer, the workbench sysctl will carry. */
+#define	NPURPC_RAW_MAX		64
+
 /* How long to wait for the target to accept the configuration, in hundredths of a second. */
 #define	NPURPC_OPEN_WAIT	500
 
@@ -71,6 +74,14 @@ struct npurpc_softc {
 
 	int			 opened;	/* the magic has been written and taken */
 	int			 stalled;	/* a command went unanswered; post no more */
+
+	/* The last hand-written exchange, kept so a read can report it. */
+	uint8_t			 raw_cmd;
+	int			 raw_plen;
+	int			 raw_err;
+	int			 raw_rc;
+	int			 raw_rlen;
+	uint8_t			 raw_resp[NPURPC_RAW_MAX];
 	uint64_t		 posted;	/* our own count, never read back */
 	uint64_t		 commands, answers, timeouts;
 };
@@ -496,6 +507,101 @@ npurpc_sysctl_probe(SYSCTL_HANDLER_ARGS)
 	return (err);
 }
 
+/*
+ * Send one command by hand, and report what came back.
+ *
+ * The channel defines forty-five commands and this driver knows the payload of exactly one of
+ * them. The rest have to be learned, and the only way to learn a payload is to send one and read
+ * the answer. The first hexadecimal number is the command, the rest are payload bytes:
+ *
+ *	sysctl dev.npuep.0.rpc_channel.command="25 00 00 00 00 01 00 00 00 00 00 00 00"
+ *	sysctl -n dev.npuep.0.rpc_channel.command
+ *
+ * Unlike the network agent's probe, this does not refuse commands that write. It cannot: the
+ * commands worth learning here are precisely the ones that fill in the interface table, and a
+ * read-only version of this would have nothing to say. So it is sharp. A mistyped command number
+ * is still a real command, and the fourteen front ports are downstream of it. It is an instrument
+ * for a workbench, not a knob for a running firewall - which is also why it reports the command it
+ * is about to send before sending it, so a mistake is visible in the log even if the target never
+ * answers.
+ */
+static int
+npurpc_sysctl_command(SYSCTL_HANDLER_ARGS)
+{
+	struct npurpc_softc *sc = arg1;
+	uint8_t pl[NPURPC_RAW_MAX];
+	char in[400], out[900], *q, *end;
+	unsigned long v;
+	int err, n = 0, i, k = 0, cmd = -1;
+
+	if (req->newptr == NULL)
+		goto report;
+
+	in[0] = '\0';
+	err = sysctl_handle_string(oidp, in, sizeof(in), req);
+	if (err != 0)
+		return (err);
+
+	memset(pl, 0, sizeof(pl));
+	for (q = in; *q != '\0'; ) {
+		while (*q == ' ' || *q == '\t' || *q == ',')
+			q++;
+		if (*q == '\0')
+			break;
+		v = strtoul(q, &end, 16);
+		if (end == q)
+			return (EINVAL);
+		q = end;
+		if (cmd < 0) {
+			if (v > 0xFF)
+				return (EINVAL);
+			cmd = (int)v;
+			continue;
+		}
+		if (v > 0xFF || n >= NPURPC_RAW_MAX)
+			return (EINVAL);
+		pl[n++] = (uint8_t)v;
+	}
+	if (cmd < 0)
+		return (EINVAL);
+
+	device_printf(sc->fac.dev, "rpc: sending command %d with %d payload bytes\n", cmd, n);
+
+	RPC_LOCK(sc);
+	sc->raw_cmd = (uint8_t)cmd;
+	sc->raw_plen = n;
+	sc->raw_rc = 0;
+	memset(sc->raw_resp, 0, sizeof(sc->raw_resp));
+	sc->raw_rlen = npurpc_command(sc, (uint8_t)cmd, pl, n, sc->raw_resp,
+	    (int)sizeof(sc->raw_resp), &sc->raw_rc);
+	sc->raw_err = sc->raw_rlen < 0 ? -sc->raw_rlen : 0;
+	if (sc->raw_rlen < 0)
+		sc->raw_rlen = 0;
+	RPC_UNLOCK(sc);
+
+report:
+	RPC_LOCK(sc);
+	if (sc->raw_cmd == 0 && sc->raw_plen == 0 && sc->raw_rlen == 0 && sc->raw_err == 0) {
+		RPC_UNLOCK(sc);
+		return (sysctl_handle_string(oidp, "nothing sent yet", 17, req));
+	}
+	k = snprintf(out, sizeof(out), "command %u, %d payload bytes -> %s",
+	    sc->raw_cmd, sc->raw_plen,
+	    sc->raw_err != 0 ? "no answer" : "answered");
+	if (sc->raw_err != 0)
+		k += snprintf(out + k, sizeof(out) - k, " (errno %d)", sc->raw_err);
+	else {
+		k += snprintf(out + k, sizeof(out) - k, ", rc %#x%s, %d bytes back:",
+		    sc->raw_rc, (sc->raw_rc & RPC_RC_ERRNO) ?
+		    " (an errno, so the target refused it)" : "", sc->raw_rlen);
+		for (i = 0; i < sc->raw_rlen && k < (int)sizeof(out) - 6; i++)
+			k += snprintf(out + k, sizeof(out) - k, " %02x", sc->raw_resp[i]);
+	}
+	RPC_UNLOCK(sc);
+
+	return (sysctl_handle_string(oidp, out, sizeof(out), req));
+}
+
 static int
 npurpc_sysctl_state(SYSCTL_HANDLER_ARGS)
 {
@@ -556,6 +662,9 @@ npurpc_add_sysctls(struct npurpc_softc *sc)
 	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "probe",
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0, npurpc_sysctl_probe, "I",
 	    "write anything to send one harmless read command and report what came back");
+	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "command",
+	    CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0, npurpc_sysctl_command, "A",
+	    "send one command by hand: the command number then its payload, all hexadecimal");
 }
 
 int
