@@ -107,6 +107,13 @@
 #define	AGNIC_CC_PF_PROMISC		0x0e
 #define	AGNIC_CC_PF_MC_PROMISC		0x0f
 #define	AGNIC_CC_PF_MTU			0x10
+/*
+ * Loopback. The vendor exposes this through ethtool and never uses it itself, which is a pity,
+ * because it is the one command that can tell a host whether ITS receive path works without
+ * anything having to arrive from the wire. Turn it on, transmit, and if the frame does not come
+ * back the fault is on this side of the link.
+ */
+#define	AGNIC_CC_PF_SET_LOOPBACK	0x11
 #define	AGNIC_CC_PF_ADD_VLAN		0x12
 #define	AGNIC_CC_PF_REMOVE_VLAN		0x13
 #define	AGNIC_CC_PF_LINK_INFO		0x19
@@ -196,6 +203,37 @@
 #define	  AGNIC_CAP_SG			(1U << 0)
 #define	AGNIC_R_CAP_MAX_BUF_SIZE	0x05	/* u32 */
 #define	AGNIC_R_CAP_EGRESS_DMA		0x09	/* u8 */
+
+/*
+ * The device's own packet counters. The vendor declares them and never asks for them; we ask,
+ * because "the coprocessor has nothing to send us" and "the coprocessor has frames and nowhere
+ * to put them" are the two remaining explanations for a silent receive path and these numbers
+ * are the only thing that separates them. rx_bm_dropped in particular is the buffer manager
+ * refusing for want of a buffer.
+ *
+ * Offsets counted from the start of the reply, so the status byte is included and everything
+ * after it is unaligned. All of these are computed from the packed declaration, not stated.
+ */
+#define	AGNIC_R_ST_RX_BYTES		0x01
+#define	AGNIC_R_ST_RX_PACKETS		0x09
+#define	AGNIC_R_ST_RX_UNICAST		0x11
+#define	AGNIC_R_ST_RX_ERRORS		0x19
+#define	AGNIC_R_ST_RX_FULLQ_DROP	0x21
+#define	AGNIC_R_ST_RX_BM_DROP		0x29
+#define	AGNIC_R_ST_RX_EARLY_DROP	0x31
+#define	AGNIC_R_ST_RX_FIFO_DROP		0x39
+#define	AGNIC_R_ST_RX_CLS_DROP		0x41
+#define	AGNIC_R_ST_TX_BYTES		0x49
+#define	AGNIC_R_ST_TX_PACKETS		0x51
+#define	AGNIC_R_ST_TX_UNICAST		0x59
+#define	AGNIC_R_ST_TX_ERRORS		0x61
+#define	AGNIC_R_ST_SIZE			0x69
+
+#define	AGNIC_P_STATS_RESET		0x00	/* u8 */
+#define	AGNIC_P_STATS_LEN		1
+
+#define	AGNIC_P_LOOPBACK		0x00	/* u8 */
+#define	AGNIC_P_LOOPBACK_LEN		1
 
 #define	AGNIC_P_MTU			0x00	/* u16 */
 #define	AGNIC_P_MTU_LEN			2
