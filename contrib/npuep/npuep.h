@@ -67,6 +67,34 @@ struct npuep_facility {
  */
 #define	NPUEP_RPC_MIN_SIZE	0x100
 
+/*
+ * The control facility's map, from the vendor's facility_conf.h. We already read its cookie and
+ * handshake; what was never read is the rest, and the rest is how a host interrupts the target.
+ *
+ *	struct ctrl_map {
+ *		u32 cookie;
+ *		u32 handshake;
+ *		u32 h2t_dbell_cnt;
+ *		struct dbell_msg h2t_dbell_msg[];   // u64 address, u32 data - twelve bytes each
+ *	};
+ *
+ * To ring doorbell n the host writes that entry's `data` to that entry's `address`. Every other
+ * facility we have implemented polls, so this has never been needed - but the control-message
+ * channel has one host-to-target doorbell and no way back, so it is needed there.
+ */
+#define	CTRL_H2T_DBELL_CNT	0x08	/* u32 */
+/*
+ * And the array starts at 0x10, not 0x0c. Three u32 fields come before it, but its first member
+ * is a u64, so the compiler pads to the next eight-byte boundary. Reading it at 0x0c produces an
+ * address of 0x0028004000000000 and a data word of zero, which is what this did until the raw
+ * words were printed beside the interpretation.
+ */
+#define	CTRL_H2T_DBELL_MSG	0x10
+#define	CTRL_DBELL_MSG_SIZE	16	/* a u64 then a u32, padded - not twelve */
+#define	  CTRL_DBELL_ADDR	0x00	/* u64 */
+#define	  CTRL_DBELL_DATA	0x08	/* u32 */
+#define	CTRL_DBELL_MAX		16	/* more than the five this board has */
+
 int	npumgmt_attach(struct npuep_facility *fac);
 void	npumgmt_detach(void);
 

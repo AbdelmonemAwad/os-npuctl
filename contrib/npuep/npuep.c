@@ -499,6 +499,55 @@ npuep_setup_dbells(struct npuep_softc *sc)
 }
 
 /*
+ * What the target published about its doorbells.
+ *
+ * Read-only, and it exists because the control-message channel cannot be driven without it: that
+ * facility has one host-to-target doorbell and no doorbell back, so a host that cannot ring it
+ * has no way to tell the target a command is waiting.
+ */
+static int
+npuep_sysctl_dbells(SYSCTL_HANDLER_ARGS)
+{
+	struct npuep_softc *sc = arg1;
+	char buf[768];
+	uint32_t cnt, data[CTRL_DBELL_MAX];
+	uint64_t addr[CTRL_DBELL_MAX];
+	int i, n = 0;
+
+	cnt = bar2_read(sc, sc->window + CTRL_H2T_DBELL_CNT);
+	if (cnt > CTRL_DBELL_MAX)
+		cnt = CTRL_DBELL_MAX;
+
+	for (i = 0; i < (int)cnt; i++) {
+		bus_size_t at = sc->window + CTRL_H2T_DBELL_MSG + i * CTRL_DBELL_MSG_SIZE;
+
+		addr[i] = (uint64_t)bar2_read(sc, at + CTRL_DBELL_ADDR) |
+		    ((uint64_t)bar2_read(sc, at + CTRL_DBELL_ADDR + 4) << 32);
+		data[i] = bar2_read(sc, at + CTRL_DBELL_DATA);
+	}
+
+	n = snprintf(buf, sizeof(buf), "%u host-to-target doorbell%s", cnt, cnt == 1 ? "" : "s");
+
+	/*
+	 * The raw words as well as the reading of them. struct dbell_msg is a u64 followed by a
+	 * u32, which the compiler pads to sixteen bytes rather than twelve - and a stride wrong by
+	 * four turns every entry after the first into nonsense, which is exactly what the first
+	 * attempt printed. Show both, so the interpretation can be checked against what is there.
+	 */
+	n += snprintf(buf + n, sizeof(buf) - n, "\n  raw from +0x%x:", CTRL_H2T_DBELL_MSG);
+	for (i = 0; i < 24 && n < (int)sizeof(buf) - 96; i++)
+		n += snprintf(buf + n, sizeof(buf) - n, "%s%08x",
+		    (i % 8) == 0 ? "\n   " : " ",
+		    bar2_read(sc, sc->window + CTRL_H2T_DBELL_MSG + i * 4));
+
+	for (i = 0; i < (int)cnt && n < (int)sizeof(buf) - 64; i++)
+		n += snprintf(buf + n, sizeof(buf) - n, "\n  %d: write %#010x to %#018jx",
+		    i, data[i], (uintmax_t)addr[i]);
+
+	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
+}
+
+/*
  * Read the control-message window, in words, from wherever you ask.
  *
  * Read only, and deliberately so. This is the one facility whose protocol we do not know, and the
@@ -591,6 +640,10 @@ npuep_add_sysctls(struct npuep_softc *sc)
 	 */
 	SYSCTL_ADD_U64(ctx, child, OID_AUTO, "handshake", CTLFLAG_RD,
 	    &sc->last_handshake, 0, "handshake word as last read by the heartbeat");
+
+	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "doorbells",
+	    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0, npuep_sysctl_dbells, "A",
+	    "the host-to-target doorbells the coprocessor published: where to write, and what");
 
 	if (sc->rpc_size != 0) {
 		SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "rpc",
