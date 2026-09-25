@@ -82,8 +82,11 @@
 #define	NPUGIU_CMD_Q_LEN	256
 #define	NPUGIU_NOTIF_Q_LEN	256
 
-/* The device answers DEV_READY within ten to twenty seconds of its own boot; the vendor waits
- * that long and so do we. DEV_MGMT_READY comes back in one to two. */
+/*
+ * The device answers DEV_READY within ten to twenty seconds of its own boot; the vendor waits that
+ * long and so do we. DEV_MGMT_READY comes back in one to two - or never, on a second load, and no
+ * amount of waiting changes that: thirty seconds was tried and measured, and the answer never came.
+ */
 #define	NPUGIU_DEV_READY_WAIT	1000	/* x 10 ms */
 #define	NPUGIU_MGMT_READY_WAIT	400	/* x 10 ms */
 #define	NPUGIU_CMD_WAIT		500	/* x 10 ms, for one command's answer */
@@ -1718,6 +1721,36 @@ npugiu_attach(struct npuep_facility *fac)
 	if (err != 0)
 		goto fail;
 
+	/*
+	 * Retract the previous session's handshake before starting a new one.
+	 *
+	 * Nothing clears DEV_MGMT_READY on the way out - not this driver, and not the device. So on
+	 * a second load it is still set from the first, the wait further down is satisfied by an
+	 * answer to a question nobody asked, and attach walks on while the device is still looking
+	 * at rings that have already been freed. That is what a command channel which handshakes
+	 * perfectly and then never answers an echo actually is. Measured on this board:
+	 *
+	 *	giu: device status 0x00000005 on arrival - dev_ready 1, host_mgmt_ready 0,
+	 *	     dev_mgmt_ready 1 - already set, so the wait below will not measure anything
+	 *
+	 * Clearing both halves costs nothing on a first load, where they are already clear. On any
+	 * later one it turns that wait back into a measurement: the device has to answer THIS
+	 * host's HOST_MGMT_READY, not the previous one's.
+	 */
+	{
+		uint32_t st0 = cfg_rd(sc, AGNIC_CFG_STATUS);
+		uint32_t both = AGNIC_CFG_STATUS_HOST_MGMT_READY | AGNIC_CFG_STATUS_DEV_MGMT_READY;
+
+		if ((st0 & both) != 0) {
+			cfg_wr(sc, AGNIC_CFG_STATUS, st0 & ~both);
+			bus_barrier(sc->fac.res, sc->fac.off, AGNIC_CFG_SIZE,
+			    BUS_SPACE_BARRIER_WRITE);
+			device_printf(fac->dev,
+			    "giu: retracted a previous session's handshake (status was %#010x)\n",
+			    st0);
+		}
+	}
+
 	lo = cfg_rd(sc, AGNIC_CFG_MAC_ADDR);
 	hi = cfg_rd(sc, AGNIC_CFG_MAC_ADDR + 4);
 	sc->mac[0] = lo & 0xFF; sc->mac[1] = (lo >> 8) & 0xFF;
@@ -1769,13 +1802,53 @@ npugiu_attach(struct npuep_facility *fac)
 	atomic_thread_fence_rel();
 	bus_barrier(sc->fac.res, sc->fac.off, AGNIC_CFG_SIZE, BUS_SPACE_BARRIER_WRITE);
 
+	/*
+	 * What the device said before this driver wrote anything.
+	 *
+	 * The bits matter in a way that is easy to miss: DEV_MGMT_READY is the device's answer to
+	 * HOST_MGMT_READY, and nothing in the teardown clears it. If it is already set here, then
+	 * the wait below is satisfied by the previous load's answer and proves nothing - the device
+	 * may still be looking at rings this driver has already freed, which is exactly what a
+	 * command channel that handshakes and then never answers looks like.
+	 */
+	{
+		uint32_t st0 = cfg_rd(sc, AGNIC_CFG_STATUS);
+
+		device_printf(fac->dev,
+		    "giu: device status %#010x on arrival - dev_ready %d, host_mgmt_ready %d, "
+		    "dev_mgmt_ready %d%s\n", st0,
+		    (st0 & AGNIC_CFG_STATUS_DEV_READY) ? 1 : 0,
+		    (st0 & AGNIC_CFG_STATUS_HOST_MGMT_READY) ? 1 : 0,
+		    (st0 & AGNIC_CFG_STATUS_DEV_MGMT_READY) ? 1 : 0,
+		    (st0 & AGNIC_CFG_STATUS_DEV_MGMT_READY) ?
+		    " - already set, so the wait below will not measure anything" : "");
+	}
+
 	cfg_wr(sc, AGNIC_CFG_STATUS,
 	    cfg_rd(sc, AGNIC_CFG_STATUS) | AGNIC_CFG_STATUS_HOST_MGMT_READY);
 
 	err = npugiu_wait_status(sc, AGNIC_CFG_STATUS_DEV_MGMT_READY, NPUGIU_MGMT_READY_WAIT,
 	    "DEV_MGMT_READY");
-	if (err != 0)
+	if (err != 0) {
+		/*
+		 * Worth spelling out, because the cost of not knowing this is an afternoon. The
+		 * device's management side waits for HOST_MGMT_READY once, answers once, and then
+		 * spends the rest of its life in its command loop. It never comes back to that
+		 * wait, so a second load on the same coprocessor boot cannot be answered.
+		 *
+		 * Three remedies were tried and measured not to help: closing the datapath down
+		 * properly with PF_DISABLE and PF_CLOSE, which the device accepts; retracting the
+		 * previous session's handshake so this one asks a real question; and waiting thirty
+		 * seconds instead of four.
+		 */
+		device_printf(fac->dev,
+		    "giu: the device answers HOST_MGMT_READY once per coprocessor boot, so a host "
+		    "reload cannot bring it back.\n");
+		device_printf(fac->dev,
+		    "giu: PF_CLOSE, retracting the handshake and a thirty-second wait were all "
+		    "measured not to help - power cycle the appliance.\n");
 		goto fail;
+	}
 
 	npugiu_sc = sc;
 
@@ -1902,7 +1975,40 @@ npugiu_detach(void)
 	if (sc == NULL)
 		return;
 
+	/*
+	 * Say goodbye while the command channel is still up.
+	 *
+	 * This driver never did, and saying goodbye is right regardless: PF_DISABLE stops the
+	 * datapath and PF_CLOSE releases the traffic classes and queues the device was given.
+	 *
+	 * It does NOT, however, fix re-attach, and this comment used to claim that it did. Measured:
+	 * the coprocessor accepts both commands - "giu: datapath closed" - and the very next load
+	 * still dies at MGMT_ECHO. Whatever the device needs in order to take a second set of rings,
+	 * it is not this. The status word printed in attach is the next place to look.
+	 *
+	 * This has to happen here, before the flags are cleared and the callout is drained: the
+	 * command path refuses to send once running is clear, and it needs the poll still alive to
+	 * notice the answer.
+	 *
+	 * Neither command is worth refusing to unload over. If the endpoint has already stopped
+	 * decoding there is nobody left to tell. But say so when it fails, because a silent failure
+	 * here is precisely what the next load trips over.
+	 */
 	GIU_LOCK(sc);
+	if (sc->datapath && cfg_rd(sc, AGNIC_CFG_STATUS) != 0xFFFFFFFFU) {
+		uint8_t pz[8];
+		int cerr;
+
+		memset(pz, 0, sizeof(pz));
+		cerr = npugiu_command(sc, AGNIC_CC_PF_DISABLE, pz, 0);
+		if (cerr != 0)
+			device_printf(sc->fac.dev, "giu: PF_DISABLE failed (%d)\n", cerr);
+		else if ((cerr = npugiu_command(sc, AGNIC_CC_PF_CLOSE, pz, 0)) != 0)
+			device_printf(sc->fac.dev, "giu: PF_CLOSE failed (%d)\n", cerr);
+		else
+			device_printf(sc->fac.dev,
+			    "giu: datapath closed - the next load can have it back\n");
+	}
 	sc->running = 0;
 	sc->datapath = 0;
 	wakeup(&sc->answered);
