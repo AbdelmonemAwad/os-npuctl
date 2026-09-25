@@ -15,10 +15,11 @@ name: checks
 #     document - the hardware identifiers here are real and there are a lot of them;
 #   * Arabic written straight into code instead of a catalogue.
 #
-# WHAT IS NOT CHECKED HERE, and it is the most important file in the repository:
-# contrib/npuep/npuep.c. It is written against FreeBSD kernel headers and cannot be compiled on
-# a Linux runner at all. It is built on the appliance by the appliance's own clang, with every
-# warning fatal. A green tick here says nothing about it.
+# WHAT IS NOT CHECKED HERE, and they are the two most important files in the repository:
+# contrib/npuep/npuep.c and contrib/npuep/npumgmt.c. They are written against FreeBSD kernel
+# headers and cannot be compiled on a Linux runner at all. They are built on the appliance by
+# the appliance's own clang, with every warning fatal. A green tick here says nothing about
+# them, and nothing whatever about whether the coprocessor is still writing where it should.
 
 on:
   push:
@@ -54,8 +55,9 @@ jobs:
           # at boot, and pkg/ is run by pkg(8) as root in the middle of an install or a removal.
           # Every one of them is a place where a syntax error is found too late - and the boot
           # hook is the one that, broken, leaves an appliance with no network interfaces and no
-          # obvious reason why.
-          for f in install/*.sh pkg/*.sh src/etc/rc.syshook.d/early/*; do
+          # obvious reason why. contrib/npuep/*.sh drive a kernel build and a module reload on the
+          # appliance over ssh, where a parse error costs a serial-console round trip to find.
+          for f in install/*.sh pkg/*.sh contrib/npuep/*.sh src/etc/rc.syshook.d/early/*; do
             [ -f "$f" ] || continue
             head -n1 "$f" | grep -q '^#!' || continue
             sh -n "$f" && echo "ok $f"
