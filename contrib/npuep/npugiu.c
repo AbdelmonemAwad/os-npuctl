@@ -148,6 +148,7 @@ struct npugiu_softc {
 	uint8_t			 answer[AGNIC_MGMT_DESC_DATA_LEN];
 
 	uint64_t		 commands, answers, notifications, drops;
+	uint64_t		 keepalives, late;
 };
 
 static struct npugiu_softc *npugiu_sc;
@@ -439,7 +440,25 @@ npugiu_drain(struct npugiu_softc *sc)
 
 		if (tag == AGNIC_CMD_ID_NOTIFICATION) {
 			sc->notifications++;
-			device_printf(sc->fac.dev, "giu: notification code 0x%02x\n", code);
+			switch (code) {
+			case AGNIC_NC_PF_KEEP_ALIVE:
+				sc->keepalives++;
+				break;
+			case AGNIC_NC_PF_LINK_CHANGE:
+				device_printf(sc->fac.dev, "giu: link change reported\n");
+				break;
+			default:
+				device_printf(sc->fac.dev,
+				    "giu: unknown notification code 0x%02x\n", code);
+				break;
+			}
+		} else if (!sc->waiting && tag == sc->wait_tag) {
+			/*
+			 * An answer to a command we have already given up on. Not an error and not
+			 * somebody else's tag - it is ours, arriving late. The first version of
+			 * this counted it as unmatched, which made a healthy channel look faulty.
+			 */
+			sc->late++;
 		} else if (sc->waiting && tag == sc->wait_tag) {
 			memcpy(sc->answer, d + AGNIC_CMD_DATA, sizeof(sc->answer));
 			sc->answered = 1;
@@ -900,9 +919,11 @@ npugiu_detach(void)
 		    "reset the coprocessor before this memory is reused\n");
 	}
 
-	device_printf(sc->fac.dev, "giu: %ju commands, %ju answers, %ju notifications, %ju "
-	    "unmatched\n", (uintmax_t)sc->commands, (uintmax_t)sc->answers,
-	    (uintmax_t)sc->notifications, (uintmax_t)sc->drops);
+	device_printf(sc->fac.dev,
+	    "giu: %ju commands, %ju answers (%ju late), %ju notifications (%ju keep-alive), "
+	    "%ju unmatched\n",
+	    (uintmax_t)sc->commands, (uintmax_t)sc->answers, (uintmax_t)sc->late,
+	    (uintmax_t)sc->notifications, (uintmax_t)sc->keepalives, (uintmax_t)sc->drops);
 
 	mtx_destroy(&sc->mtx);
 	free(sc, M_DEVBUF);
