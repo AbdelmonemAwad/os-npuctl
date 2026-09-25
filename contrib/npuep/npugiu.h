@@ -116,6 +116,8 @@
 #define	AGNIC_CC_PF_SET_LOOPBACK	0x11
 #define	AGNIC_CC_PF_ADD_VLAN		0x12
 #define	AGNIC_CC_PF_REMOVE_VLAN		0x13
+#define	AGNIC_CC_PF_GET_GP_STATS	0x14	/* THIS is the GIU port's own counters */
+#define	AGNIC_CC_PF_GET_GP_QUEUE_STATS	0x15
 #define	AGNIC_CC_PF_LINK_INFO		0x19
 #define	AGNIC_CC_GET_CAPABILITIES	0x1e
 
@@ -214,6 +216,18 @@
  * Offsets counted from the start of the reply, so the status byte is included and everything
  * after it is unaligned. All of these are computed from the packed declaration, not stated.
  */
+/*
+ * The thirteen-field block below is NOT this device's traffic, and reading it cost an evening.
+ *
+ * Marvell's own header labels it CC_PF_PP2_STATISTICS: PP2 is the physical packet processor, the
+ * switch's MAC. Our function has no physical port, so it answers this command truthfully with a
+ * full-length reply of zeros - which reads exactly like a broken counter and is not one. The
+ * driver reported "rx 0 packets" while netstat counted hundreds arriving, and the instrument was
+ * the thing that was wrong.
+ *
+ * The GIU port's own counters are a different command and a different, shorter member of the same
+ * reply union - three fields, below. Kept here because the distinction is the whole lesson.
+ */
 #define	AGNIC_R_ST_RX_BYTES		0x01
 #define	AGNIC_R_ST_RX_PACKETS		0x09
 #define	AGNIC_R_ST_RX_UNICAST		0x11
@@ -228,6 +242,23 @@
 #define	AGNIC_R_ST_TX_UNICAST		0x59
 #define	AGNIC_R_ST_TX_ERRORS		0x61
 #define	AGNIC_R_ST_SIZE			0x69
+
+/* struct gp_stats, the answer to GET_GP_STATS. Three fields after the status byte. */
+#define	AGNIC_R_GP_RX_PACKETS		0x01
+#define	AGNIC_R_GP_RX_FULLQ_DROP	0x09
+#define	AGNIC_R_GP_TX_PACKETS		0x11
+#define	AGNIC_R_GP_SIZE			0x19
+
+/* struct q_stats, the answer to GET_GP_QUEUE_STATS. One field. */
+#define	AGNIC_R_Q_PACKETS		0x01
+#define	AGNIC_R_Q_SIZE			0x09
+
+/* struct pf_q_get_statistics - which direction, which traffic class, which queue. */
+#define	AGNIC_P_QSTATS_OUT		0x00	/* u8 - non-zero for transmit */
+#define	AGNIC_P_QSTATS_TC		0x01	/* u8 */
+#define	AGNIC_P_QSTATS_QID		0x02	/* u8 */
+#define	AGNIC_P_QSTATS_RESET		0x03	/* u8 */
+#define	AGNIC_P_QSTATS_LEN		4
 
 #define	AGNIC_P_STATS_RESET		0x00	/* u8 */
 #define	AGNIC_P_STATS_LEN		1

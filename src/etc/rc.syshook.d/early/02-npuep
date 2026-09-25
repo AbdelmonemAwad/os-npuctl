@@ -1,0 +1,62 @@
+#!/bin/sh
+# Load the NPU endpoint driver, and wait for its interfaces before OPNsense configures them.
+#
+# Numbered 02 so it runs after 01-npuctl, and the order is not a preference: 01 is what pulses the
+# coprocessor out of reset, and until that has happened there is no live device here to attach to.
+# The same fact rules out loader.conf, along with a second one - the BAR restore this hardware
+# needs only happens on the kldload path. See docs/porting-notes.md.
+#
+# THE WAITING MATTERS MORE THAN THE LOADING. Every early hook runs before OPNsense configures its
+# interfaces, so if the front ports exist by the time this returns, the firewall's own
+# configuration finds them and they can carry rules. If it returns too soon they are simply absent
+# from that pass, and no amount of correct driver code afterwards puts them back into it.
+#
+# The coprocessor needs roughly half a minute from its reset pulse before it answers at all, and
+# its network agent a further ten seconds after that. So this waits, and reports how long it took -
+# a number worth watching, because it is the one that decides whether this hook is worth its delay.
+#
+# It gives up rather than hanging. A firewall that boots late is better than one that boots without
+# its ports, and a firewall that does not boot at all is worse than both. Every failure here logs
+# and exits 0: no module, unfamiliar hardware, a coprocessor that never answers.
+#
+# One caveat that is a property of the hardware and not of this script: the datapath attaches once
+# per COPROCESSOR boot. After a warm reboot of the host the coprocessor is still running from
+# before and will not answer a second bring-up, so the interfaces will not appear and the driver
+# says so in its own messages. A cold power cycle is what restores it.
+
+: ${MODULE:=/boot/modules/npuep.ko}
+: ${FIRST_IF:=npup1}
+: ${WAIT:=45}
+
+log() { /usr/bin/logger -t npuep -p daemon.notice "$1"; }
+
+if /sbin/kldstat -q -n npuep; then
+    log "already loaded, nothing to do"
+    exit 0
+fi
+
+if [ ! -f "${MODULE}" ]; then
+    # Not an error. The module is built on the appliance rather than packaged - it is C against
+    # this kernel's headers - so a machine that has the plugin but not the module is a normal
+    # state, not a broken one.
+    log "no ${MODULE} - the driver is not installed on this machine, nothing to do"
+    exit 0
+fi
+
+if ! /sbin/kldload "${MODULE}" 2>/dev/null; then
+    log "kldload ${MODULE} failed - the front ports will not be available this boot"
+    exit 0
+fi
+
+i=0
+while [ ${i} -lt "${WAIT}" ]; do
+    if /sbin/ifconfig "${FIRST_IF}" >/dev/null 2>&1; then
+        log "front ports present after ${i}s - OPNsense can configure them"
+        exit 0
+    fi
+    i=$((i + 1))
+    sleep 1
+done
+
+log "waited ${WAIT}s and ${FIRST_IF} never appeared; carrying on so the firewall still boots - see the npuep messages in dmesg for why"
+exit 0
