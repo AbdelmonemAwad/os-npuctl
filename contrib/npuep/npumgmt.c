@@ -1027,20 +1027,55 @@ npumgmt_attach(struct npuep_facility *fac)
 		goto fail;
 
 	/*
-	 * The peer's address is offered in remote_mac. Nothing in the vendor source ever reads
-	 * it, so treat it as advisory: use it when it looks like a unicast address and invent a
-	 * locally-administered one otherwise, rather than coming up with no address at all.
+	 * The peer's address is offered in remote_mac, and on this hardware it is always zero.
+	 * That is measured, not assumed: the vendor's driver neither writes the field nor reads
+	 * it, and a dump of the window taken after LINK_ESTABLISHED, with traffic flowing, shows
+	 * eight zero bytes. So this read is a courtesy to a firmware that might one day fill it
+	 * in, and the address that actually gets used is the one derived below.
+	 *
+	 * It is read as six bytes from the start of the field, which is where a u8 mac[6] at
+	 * +0x20 puts them. An earlier version took bytes 2..7 of the little-endian u64, which
+	 * would have mis-parsed a populated field; nothing caught it because the field is zero.
 	 */
 	remote = (uint64_t)cfg_rd4(sc, CFG_REMOTE_MAC) |
 	    ((uint64_t)cfg_rd4(sc, CFG_REMOTE_MAC + 4) << 32);
-	memcpy(mac, (uint8_t *)&remote + 2, ETHER_ADDR_LEN);
+	memcpy(mac, &remote, ETHER_ADDR_LEN);
+
 	if ((mac[0] & 0x01) != 0 || (mac[0] | mac[1] | mac[2] | mac[3] | mac[4] | mac[5]) == 0) {
-		mac[0] = 0x02;		/* locally administered, unicast */
+		/*
+		 * Locally administered and unicast, and derived rather than constant. Two
+		 * appliances answering to the same address are indistinguishable the moment this
+		 * interface is bridged or bonded, and a hardcoded one is the sort of thing that
+		 * only ever gets found the hard way. The board's SMBIOS planar serial is the one
+		 * identifier available this early that is stable across reboots and differs
+		 * between units; it is folded to 24 bits, which is not reversible back to it.
+		 */
+		char *serial = kern_getenv("smbios.planar.serial");
+		uint32_t h = 2166136261U;	/* FNV-1a */
+
+		if (serial != NULL) {
+			const char *c;
+
+			for (c = serial; *c != '\0'; c++) {
+				h ^= (uint8_t)*c;
+				h *= 16777619U;
+			}
+			freeenv(serial);
+		} else {
+			h ^= (uint32_t)device_get_unit(fac->dev);
+			h *= 16777619U;
+		}
+
+		mac[0] = 0x02;
 		mac[1] = 0x00;
 		mac[2] = 0x00;
-		mac[3] = 0x00;
-		mac[4] = 0x00;
-		mac[5] = 0x01;
+		mac[3] = (h >> 16) & 0xFF;
+		mac[4] = (h >> 8) & 0xFF;
+		mac[5] = h & 0xFF;
+
+		/* 02:00:00:00:00:00 is the one value that says "nothing was derived". */
+		if (mac[3] == 0 && mac[4] == 0 && mac[5] == 0)
+			mac[5] = 0x01;
 	} else {
 		mac[5] ^= 1;		/* our end of the link, not the peer's */
 	}
