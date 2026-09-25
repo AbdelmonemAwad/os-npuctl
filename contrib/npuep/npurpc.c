@@ -46,6 +46,8 @@
  */
 #define	NPURPC_DESC_OFF		0x1000
 #define	NPURPC_DESC_COUNT	32
+#define	NPURPC_HI_DESC_OFF	0x2000
+#define	NPURPC_HI_DESC_COUNT	32
 
 /* How long to wait for the target to accept the configuration, in hundredths of a second. */
 #define	NPURPC_OPEN_WAIT	500
@@ -68,6 +70,7 @@ struct npurpc_softc {
 	bus_addr_t		 cmd_paddr;
 
 	int			 opened;	/* the magic has been written and taken */
+	int			 stalled;	/* a command went unanswered; post no more */
 	uint64_t		 posted;	/* our own count, never read back */
 	uint64_t		 commands, answers, timeouts;
 };
@@ -89,6 +92,18 @@ rpc_wr(struct npurpc_softc *sc, bus_size_t o, uint32_t v)
 	bus_write_4(sc->fac.res, sc->fac.off + o, v);
 }
 
+/*
+ * The first eight bytes of the state block are one field to the target: it compares the whole
+ * quadword against its cached copy to decide whether the configuration changed. Writing it in two
+ * halves would let it read a magic belonging to one configuration beside a ring count belonging to
+ * another, so it is written whole.
+ */
+static void
+rpc_wr8(struct npurpc_softc *sc, bus_size_t o, uint64_t v)
+{
+	bus_write_8(sc->fac.res, sc->fac.off + o, v);
+}
+
 static void
 rpc_barrier(struct npurpc_softc *sc)
 {
@@ -104,38 +119,63 @@ npurpc_dmamap_cb(void *arg, bus_dma_segment_t *segs, int nseg, int error)
 }
 
 /*
- * Lay out one ring in the window.
+ * Lay out the rings in the window.
  *
- * Only the low-priority ring is configured. The channel allows four more at high priority, one
- * per core, and the vendor uses them to keep flow updates off the slow path - but nothing here
- * has a rate that would notice, and each additional ring is another descriptor area and another
- * set of indices to get wrong.
+ * Two of them, and the second is not an optimisation - it is the difference between a channel that
+ * works and one that answers a single command and then takes the coprocessor down with it.
+ *
+ * The rpc facility on this board has exactly one host-to-target doorbell, and the target's
+ * interrupt handler treats that as meaning the high-priority ring shares it: on every doorbell
+ * that is not a configuration change it schedules high ring zero's tasklet, whatever the host has
+ * declared. If the host declared no high rings, that ring's context was never filled in, so the
+ * tasklet runs against facility zero, doorbell zero. Facility zero is ctrl, which has no
+ * host-to-target doorbells at all, so enabling it fails - and the failure path reschedules the
+ * tasklet unconditionally. It re-arms itself forever, printing two unratelimited errors per pass
+ * to a 115200 console, on the one core left to housekeeping by isolcpus - the same core that runs
+ * the low ring's work item. The low ring is never serviced again.
+ *
+ * That is not a hypothesis. It is what happened here four times in a row, and the vendor's own
+ * host avoids it by declaring one high ring, which its boot log records as "Allocated DMA dev #0
+ * to hi ring #1 on doorbell 3.0".
+ *
+ * So high ring zero is declared, sharing this facility's doorbell, with its indices equal and its
+ * descriptor area empty. The target's ring walker returns immediately when posted equals done, so
+ * the ring carries nothing; it exists so that the tasklet has a doorbell it is allowed to enable.
+ *
+ * Everything the target can read is cleared first, including the four high-ring slots this driver
+ * would otherwise never touch. They are bound to the target's ring contexts when its own module
+ * loads, not when a ring is declared, so whatever an earlier operating system left in them is live.
  */
 static void
-npurpc_layout_ring(struct npurpc_softc *sc)
+npurpc_layout_one(struct npurpc_softc *sc, bus_size_t r, bus_size_t desc, uint32_t count,
+    uint32_t cfg)
 {
-	bus_size_t r = RPC_ST_RING_LO;
-	int i;
+	uint32_t i;
 
-	mtx_assert(&sc->mtx, MA_OWNED);
+	for (i = 0; i < count * 16; i += 4)
+		rpc_wr(sc, desc + i, 0);
 
-	/* Clear the descriptor area before the target is told where it is. */
-	for (i = 0; i < NPURPC_DESC_COUNT * 16; i += 4)
-		rpc_wr(sc, NPURPC_DESC_OFF + i, 0);
-
-	/*
-	 * Both indices start at zero, and that is what makes writing the magic safe: with nothing
-	 * posted the target has no descriptor to fetch, so it cannot be pointed at a host address
-	 * this driver has not chosen yet.
-	 */
 	rpc_wr(sc, r + RPC_RING_POSTED, 0);
 	rpc_wr(sc, r + RPC_RING_POSTED + 4, 0);
 	rpc_wr(sc, r + RPC_RING_DONE, 0);
 	rpc_wr(sc, r + RPC_RING_DONE + 4, 0);
 
-	rpc_wr(sc, r + RPC_RING_OFFSET, NPURPC_DESC_OFF);
-	rpc_wr(sc, r + RPC_RING_DESC_OFFSET, NPURPC_DESC_OFF);
-	rpc_wr(sc, r + RPC_RING_DESC_COUNT, NPURPC_DESC_COUNT);
+	rpc_wr(sc, r + RPC_RING_OFFSET, (uint32_t)desc);
+	rpc_wr(sc, r + RPC_RING_DESC_OFFSET, (uint32_t)desc);
+	rpc_wr(sc, r + RPC_RING_DESC_COUNT, count);
+	rpc_wr(sc, r + RPC_RING_CFG, cfg);
+}
+
+static void
+npurpc_layout_ring(struct npurpc_softc *sc)
+{
+	bus_size_t o;
+
+	mtx_assert(&sc->mtx, MA_OWNED);
+
+	/* The whole state block, not just the parts this driver fills in. */
+	for (o = 0; o < RPC_STATE_SIZE; o += 4)
+		rpc_wr(sc, o, 0);
 
 	/*
 	 * ring_num 0, facility index 3 - the control-message channel's own - doorbell 0, not
@@ -143,58 +183,101 @@ npurpc_layout_ring(struct npurpc_softc *sc)
 	 * facility order and every facility before this one declares none, which is also why it is
 	 * the only one the target has armed.
 	 */
-	rpc_wr(sc, r + RPC_RING_CFG, (0) | (3 << 8) | (0 << 16) | (0 << 24));
+	npurpc_layout_one(sc, RPC_ST_RING_LO, NPURPC_DESC_OFF, NPURPC_DESC_COUNT,
+	    (0) | (3 << 8) | (0 << 16) | (0 << 24));
+
+	/* ring_num 1, same facility, same doorbell, and shared - which is what says so. */
+	npurpc_layout_one(sc, RPC_ST_RINGS, NPURPC_HI_DESC_OFF, NPURPC_HI_DESC_COUNT,
+	    (1) | (3 << 8) | (0 << 16) | (1 << 24));
 
 	rpc_barrier(sc);
 }
 
 /*
- * Open the channel: publish a ring, then write the magic the target is waiting for.
+ * Wait for the target to say it has taken a configuration.
  *
- * The order is the whole safety argument. The ring is laid out and the descriptor area cleared
- * BEFORE the magic goes in, because the magic is what makes the target start reading descriptors
- * out of this window. Written against an unconfigured ring it would send the coprocessor to
- * whatever address happened to be lying there - host physical zero, as the window stands.
+ * It clears reconfig_done when it starts and sets it when it has finished, so this is only
+ * meaningful after writing a configuration word with that byte zero - which both writes below do.
+ * The previous version of this waited for the byte to be non-zero without ever having cleared it,
+ * which the state the channel starts in satisfies immediately. It measured nothing.
+ */
+static int
+npurpc_wait_reconfig(struct npurpc_softc *sc)
+{
+	int i;
+
+	for (i = 0; i < NPURPC_OPEN_WAIT; i++) {
+		if ((rpc_rd(sc, RPC_ST_CFG_REVISION) >> 24) != 0)
+			return (0);
+		pause("npurpco", hz / 100);
+	}
+	return (ETIMEDOUT);
+}
+
+/*
+ * Open the channel: publish the rings, then hand the target a configuration in two steps.
+ *
+ * Two steps because that is what the vendor's host does - its boot log shows "updating ring
+ * configuration: 0" and then "updating ring configuration: 1015fd7d3ab00", which is this same
+ * quadword carrying the magic, revision 0x015f, one active high ring and reconfig_done clear. The
+ * zero first tears down whatever the target was holding, so the second is taken from a known state
+ * rather than merged into one this driver did not create.
+ *
+ * The rings are laid out and both descriptor areas cleared BEFORE any of it, because the
+ * configuration is what makes the target start reading descriptors out of this window. Written
+ * against an unconfigured ring it would send the coprocessor to whatever address happened to be
+ * lying there - host physical zero, as the window stands.
  */
 static int
 npurpc_open(struct npurpc_softc *sc)
 {
-	uint32_t cfg;
-	int i;
+	uint64_t cfg;
+	uint32_t st;
+	int err;
 
 	mtx_assert(&sc->mtx, MA_OWNED);
 
 	npurpc_layout_ring(sc);
 
-	rpc_wr(sc, RPC_ST_CFG_MAGIC, RPC_STATE_CFG_MAGIC);
+	rpc_wr8(sc, RPC_ST_CFG_MAGIC, 0);
 	rpc_barrier(sc);
-
 	(void)npuep_ring_dbell(sc->fac.parent, sc->fac.dbell);
-
-	/*
-	 * The target clears reconfig_done while it takes the new configuration and sets it again
-	 * when it has. It was already set before we wrote anything, so watching for it to come
-	 * back would be satisfied instantly by the state we started from - wait for the magic to
-	 * be acknowledged instead, and report what the state block says either way.
-	 */
-	for (i = 0; i < NPURPC_OPEN_WAIT; i++) {
-		cfg = rpc_rd(sc, RPC_ST_CFG_REVISION);
-		if ((cfg >> 24) != 0 && rpc_rd(sc, RPC_ST_CFG_MAGIC) == RPC_STATE_CFG_MAGIC) {
-			sc->opened = 1;
-			device_printf(sc->fac.dev,
-			    "rpc: channel open - revision %u, %u high rings active, "
-			    "descriptors at +%#x x%d\n",
-			    cfg & 0xFFFF, (cfg >> 16) & 0xFF, NPURPC_DESC_OFF,
-			    NPURPC_DESC_COUNT);
-			return (0);
-		}
-		pause("npurpc", hz / 100);
+	if ((err = npurpc_wait_reconfig(sc)) != 0) {
+		device_printf(sc->fac.dev,
+		    "rpc: the target did not acknowledge the empty configuration - state %#010x\n",
+		    rpc_rd(sc, RPC_ST_CFG_REVISION));
+		return (err);
 	}
 
+	cfg = (uint64_t)RPC_STATE_CFG_MAGIC |		/* cfg_magic       */
+	    ((uint64_t)RPC_CFG_REVISION << 32) |	/* cfg_revision    */
+	    ((uint64_t)1 << 48);			/* active_hi_rings */
+	rpc_wr8(sc, RPC_ST_CFG_MAGIC, cfg);
+	rpc_barrier(sc);
+	(void)npuep_ring_dbell(sc->fac.parent, sc->fac.dbell);
+	if ((err = npurpc_wait_reconfig(sc)) != 0) {
+		device_printf(sc->fac.dev,
+		    "rpc: the target did not take the configuration - magic reads %#010x, "
+		    "state %#010x\n",
+		    rpc_rd(sc, RPC_ST_CFG_MAGIC), rpc_rd(sc, RPC_ST_CFG_REVISION));
+		return (err);
+	}
+
+	if (rpc_rd(sc, RPC_ST_CFG_MAGIC) != RPC_STATE_CFG_MAGIC) {
+		device_printf(sc->fac.dev,
+		    "rpc: the target acknowledged but the magic did not stick - reads %#010x\n",
+		    rpc_rd(sc, RPC_ST_CFG_MAGIC));
+		return (EIO);
+	}
+
+	sc->opened = 1;
+	sc->stalled = 0;
+	st = rpc_rd(sc, RPC_ST_CFG_REVISION);
 	device_printf(sc->fac.dev,
-	    "rpc: the target did not take the configuration - magic reads %#010x, state %#010x\n",
-	    rpc_rd(sc, RPC_ST_CFG_MAGIC), rpc_rd(sc, RPC_ST_CFG_REVISION));
-	return (ETIMEDOUT);
+	    "rpc: channel open - revision %u, %u high ring sharing doorbell %d, "
+	    "descriptors at +%#x x%d\n",
+	    st & 0xFFFF, (st >> 16) & 0xFF, sc->fac.dbell, NPURPC_DESC_OFF, NPURPC_DESC_COUNT);
+	return (0);
 }
 
 static int
@@ -245,19 +328,24 @@ npurpc_free_cmd(struct npurpc_softc *sc)
  * barrier, ring. Anything the target is meant to see must be visible before the index that says
  * it is there, and the index before the doorbell that says to look.
  *
- * On the producer and consumer indices there is one thing this driver does not yet know: whether
- * they count or merely flag. Marvell's sample handler writes done = 1 and tests posted != 0,
- * which is what a test would do; the production handler may well treat them as running counts,
- * the way the datapath's rings do. For the FIRST command the two readings agree - post 1, wait
- * for 1 - so this is written to be correct either way, and what the target actually does to done
- * is then a measurement rather than an assumption.
+ * The indices are running counts, not flags. The target takes the descriptor at
+ * done & (desc_count - 1) and then increments done, so a command's slot is fixed by its sequence
+ * number and desc_count has to be a power of two. Thirty-two is.
+ *
+ * Two fields here were wrong for as long as this channel has existed, and both came from reading
+ * the names rather than the code. payload_len is the payload alone: the target adds the eight-byte
+ * command header itself when it sizes the fetch, so including it here made every fetch eight bytes
+ * too long. And the post flag does not mean "this descriptor is posted" - it means "post only, do
+ * not answer". With it set the target runs the command and advances done without ever calling the
+ * routine that writes a response, which is exactly what we saw: a command the target completed,
+ * whose answer buffer still held what this driver had put in it.
  */
 static int
 npurpc_command(struct npurpc_softc *sc, uint8_t cmd, const void *payload, int plen,
     void *resp, int rlen, int *rcout)
 {
 	uint8_t *b = sc->cmd_vaddr;
-	bus_size_t d = NPURPC_DESC_OFF;		/* slot zero; one in flight at a time */
+	bus_size_t d;
 	uint64_t want;
 	uint32_t lo, hi;
 	uint16_t rc, rpl;
@@ -267,6 +355,13 @@ npurpc_command(struct npurpc_softc *sc, uint8_t cmd, const void *payload, int pl
 
 	if (!sc->opened)
 		return (-ENXIO);
+	/*
+	 * One unanswered command is the whole of the evidence that the target has stopped
+	 * servicing this ring, and posting another on top of it is how a stall became an hour of
+	 * dead coprocessor. Refuse until the channel is opened again.
+	 */
+	if (sc->stalled)
+		return (-ESHUTDOWN);
 	if (plen < 0 || plen + RPC_CMD_PAYLOAD > RPC_DATA_MAX_SIZE)
 		return (-EINVAL);
 
@@ -278,16 +373,18 @@ npurpc_command(struct npurpc_softc *sc, uint8_t cmd, const void *payload, int pl
 
 	bus_dmamap_sync(sc->cmd_tag, sc->cmd_map, BUS_DMASYNC_PREWRITE | BUS_DMASYNC_PREREAD);
 
-	/* The descriptor: where the command is, how long it is, and that it is posted. */
+	/* The slot this command will be taken from, and the sequence number that says so. */
+	want = sc->posted + 1;
+	d = NPURPC_DESC_OFF + (bus_size_t)((want - 1) & (NPURPC_DESC_COUNT - 1)) * 16;
+
+	/* The descriptor: where the command is and how long its payload is. */
 	rpc_wr(sc, d + RPC_BD_DMA_ADDR, (uint32_t)(sc->cmd_paddr & 0xFFFFFFFFU));
 	rpc_wr(sc, d + RPC_BD_DMA_ADDR + 4, (uint32_t)(sc->cmd_paddr >> 32));
 	rpc_wr(sc, d + RPC_BD_PAYLOAD_LEN,
-	    (uint32_t)(RPC_CMD_PAYLOAD + plen) |
-	    ((uint32_t)(RPC_DESC_POST_FLAG | RPC_DESC_NO_AGG_DMA) << 16));
+	    (uint32_t)plen | ((uint32_t)RPC_DESC_NO_AGG_DMA << 16));
 	rpc_wr(sc, d + 12, 0);
 	rpc_barrier(sc);
 
-	want = sc->posted + 1;
 	rpc_wr(sc, RPC_ST_RING_LO + RPC_RING_POSTED, (uint32_t)want);
 	rpc_wr(sc, RPC_ST_RING_LO + RPC_RING_POSTED + 4, (uint32_t)(want >> 32));
 	rpc_barrier(sc);
@@ -304,8 +401,10 @@ npurpc_command(struct npurpc_softc *sc, uint8_t cmd, const void *payload, int pl
 	}
 	if (i >= NPURPC_CMD_WAIT) {
 		sc->timeouts++;
+		sc->stalled = 1;
 		device_printf(sc->fac.dev,
-		    "rpc: command %u went unanswered - posted %ju, done %ju\n",
+		    "rpc: command %u went unanswered - posted %ju, done %ju. No more will be sent "
+		    "until the channel is reopened.\n",
 		    cmd, (uintmax_t)want, (uintmax_t)((uint64_t)lo | ((uint64_t)hi << 32)));
 		return (-ETIMEDOUT);
 	}
@@ -314,6 +413,17 @@ npurpc_command(struct npurpc_softc *sc, uint8_t cmd, const void *payload, int pl
 	sc->answers++;
 
 	bus_dmamap_sync(sc->cmd_tag, sc->cmd_map, BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
+
+	/*
+	 * done having advanced says the target finished with the descriptor; this byte says it
+	 * wrote an answer. They are not the same thing, and keeping them apart is what turned a
+	 * silent wrong answer into a visible one last time.
+	 */
+	if (b[RPC_RESP_DESC_DONE] == 0) {
+		device_printf(sc->fac.dev,
+		    "rpc: command %u completed without an answer - descriptor_done clear\n", cmd);
+		return (-EIO);
+	}
 
 	rc = le16dec(b + RPC_RESP_RC);
 	rpl = le16dec(b + RPC_RESP_PAYLOAD_LEN);
@@ -390,10 +500,10 @@ static int
 npurpc_sysctl_state(SYSCTL_HANDLER_ARGS)
 {
 	struct npurpc_softc *sc = arg1;
-	char buf[320];
-	uint64_t posted, done;
-	uint32_t magic, cfg;
-	bus_size_t r = RPC_ST_RING_LO;
+	char buf[512];
+	uint64_t posted, done, hposted, hdone;
+	uint32_t magic, cfg, hcfg;
+	bus_size_t r = RPC_ST_RING_LO, h = RPC_ST_RINGS;
 
 	RPC_LOCK(sc);
 	magic = rpc_rd(sc, RPC_ST_CFG_MAGIC);
@@ -402,14 +512,23 @@ npurpc_sysctl_state(SYSCTL_HANDLER_ARGS)
 	    ((uint64_t)rpc_rd(sc, r + RPC_RING_POSTED + 4) << 32);
 	done = (uint64_t)rpc_rd(sc, r + RPC_RING_DONE) |
 	    ((uint64_t)rpc_rd(sc, r + RPC_RING_DONE + 4) << 32);
+	hposted = (uint64_t)rpc_rd(sc, h + RPC_RING_POSTED) |
+	    ((uint64_t)rpc_rd(sc, h + RPC_RING_POSTED + 4) << 32);
+	hdone = (uint64_t)rpc_rd(sc, h + RPC_RING_DONE) |
+	    ((uint64_t)rpc_rd(sc, h + RPC_RING_DONE + 4) << 32);
+	hcfg = rpc_rd(sc, h + RPC_RING_CFG);
 	RPC_UNLOCK(sc);
 
 	snprintf(buf, sizeof(buf),
-	    "%s  magic %#010x  revision %u  hi_rings %u  reconfig_done %u\n"
-	    "  low ring: posted %ju done %ju (this driver has posted %ju)\n"
+	    "%s%s  magic %#010x  revision %u  hi_rings %u  reconfig_done %u\n"
+	    "  low ring:  posted %ju done %ju (this driver has posted %ju)\n"
+	    "  high ring: posted %ju done %ju  num %u fclt %u dbell %u shared %u\n"
 	    "  commands %ju answered %ju timed out %ju",
-	    sc->opened ? "open" : "not open", magic, cfg & 0xFFFF, (cfg >> 16) & 0xFF,
-	    (cfg >> 24) & 0xFF, (uintmax_t)posted, (uintmax_t)done, (uintmax_t)sc->posted,
+	    sc->opened ? "open" : "not open", sc->stalled ? ", STALLED" : "",
+	    magic, cfg & 0xFFFF, (cfg >> 16) & 0xFF, (cfg >> 24) & 0xFF,
+	    (uintmax_t)posted, (uintmax_t)done, (uintmax_t)sc->posted,
+	    (uintmax_t)hposted, (uintmax_t)hdone,
+	    hcfg & 0xFF, (hcfg >> 8) & 0xFF, (hcfg >> 16) & 0xFF, (hcfg >> 24) & 0xFF,
 	    (uintmax_t)sc->commands, (uintmax_t)sc->answers, (uintmax_t)sc->timeouts);
 
 	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
