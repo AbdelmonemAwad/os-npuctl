@@ -134,6 +134,8 @@ struct npuep_softc {
 	bus_size_t		 ctrl;		/* ctrl_map, absolute in BAR2 */
 	bus_size_t		 mgmt_off;	/* mvmgmt facility, absolute in BAR2 */
 	bus_size_t		 mgmt_size;
+	bus_size_t		 giu_off;	/* giu facility, absolute in BAR0 */
+	bus_size_t		 giu_size;
 
 	int			 nvec;
 	int			 busmaster;	/* we turned it on, we turn it off */
@@ -288,6 +290,25 @@ npuep_read_barmap(struct npuep_softc *sc)
 		    off <= NPU_BARMAP_WINDOW_LEN - size && (off & 7) == 0) {
 			sc->mgmt_off = sc->window + off;
 			sc->mgmt_size = size;
+		}
+
+		/*
+		 * And the giu facility, which is on BAR0 rather than BAR2 - so it is bounded
+		 * against that resource's real size, not against the BAR2 window length. Same
+		 * arithmetic order as above: bound the size before it is used as a subtrahend.
+		 */
+		if (type == MV_FACILITY_GIU && bar == 0) {
+			bus_size_t bar0_len = rman_get_size(sc->bar0);
+
+			if (size >= NPUEP_GIU_MIN_SIZE && (bus_size_t)size <= bar0_len &&
+			    (bus_size_t)off <= bar0_len - size && (off & 7) == 0) {
+				sc->giu_off = off;
+				sc->giu_size = size;
+			} else {
+				device_printf(dev,
+				    "giu facility [off %#x size %u] does not fit BAR0 - "
+				    "ignoring it\n", off, size);
+			}
 		}
 
 		if (type == MV_FACILITY_CONTROL) {
@@ -575,6 +596,25 @@ npuep_attach(device_t dev)
 
 		if (npumgmt_attach(&fac) != 0)
 			device_printf(dev, "management interface did not attach\n");
+		/*
+		 * Then the command channel behind the fourteen front ports. Like the management
+		 * interface, its failure is not this driver's failure: the endpoint, the
+		 * doorbells, the handshake and mvmgmt0 are all useful without it.
+		 */
+		if (sc->giu_off != 0 || sc->giu_size != 0) {
+			struct npuep_facility gfac;
+
+			gfac.dev = dev;
+			gfac.res = sc->bar0;
+			gfac.off = sc->giu_off;
+			gfac.size = sc->giu_size;
+			gfac.parent_tag = bus_get_dma_tag(dev);
+
+			if (npugiu_attach(&gfac) != 0)
+				device_printf(dev, "giu command channel did not attach\n");
+		} else {
+			device_printf(dev, "no giu facility in the barmap\n");
+		}
 	} else {
 		device_printf(dev, "no mvmgmt facility in the barmap\n");
 	}
@@ -598,7 +638,8 @@ npuep_detach(device_t dev)
 	struct npuep_softc *sc = device_get_softc(dev);
 	int i;
 
-	/* Withdraw from the far side before anything underneath it is torn down. */
+	/* Withdraw from the far side before anything underneath it is torn down, newest first. */
+	npugiu_detach();
 	npumgmt_detach();
 
 	if (mtx_initialized(&sc->mtx)) {
