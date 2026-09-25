@@ -75,6 +75,22 @@
 #define	  NWA_RP_STATUS_OK	0
 #define	NWA_RP_PAYLOAD		0x08
 
+/*
+ * The longest raw request and reply the probe below will carry, in 32-bit words. The window is
+ * tens of kilobytes and the far side advertises a maximum request of about 32 KB, so neither of
+ * these is a protocol limit - they are what fits in a sysctl string without becoming unreadable.
+ */
+/*
+ * The port-statistics request is 34 words: an opcode, a count, and sixteen eight-byte entries.
+ * Sixty-four leaves room for a longer list without leaving room for a typo to matter.
+ */
+#define	NWA_RAW_MAX_REQ_WORDS	64
+/*
+ * The status reply is 4232 bytes - measured, by sending the request the vendor's host sends and
+ * reading what came back - so anything smaller truncates it. 1088 words is that with room.
+ */
+#define	NWA_RAW_MAX_REPLY_WORDS	1088
+
 /* operations */
 #define	NWA_OP_DISCOVER		0x01
 #define	NWA_OP_SET		0x03
