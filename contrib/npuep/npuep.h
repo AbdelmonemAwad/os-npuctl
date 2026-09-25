@@ -52,6 +52,21 @@ struct npuep_facility {
 /* The smallest nwa window that can hold the mailbox header, the request and its reply. */
 #define	NPUEP_NWA_MIN_SIZE	0x100
 
+/*
+ * The fourth facility, and the last one this driver does not speak.
+ *
+ * The vendor's host reaches it through usfp_firewall.ko, which its module dependencies show
+ * sitting on mv_armada_drv - the facility layer - alongside the three modules whose facilities we
+ * already implement. Its own boot message is `usfp_firewall_cmsg_init: real_dev: ... mv-pcimux0`,
+ * so it is a control-message channel attached to the trunk interface. On the evidence, this is
+ * what tells the coprocessor's fastpath where to send a frame, which is the one thing still
+ * standing between a configured datapath and a frame arriving on it.
+ *
+ * A megabyte, one host-to-target doorbell, one DMA engine. Nothing is written to it here: this
+ * only captures the window so it can be read.
+ */
+#define	NPUEP_RPC_MIN_SIZE	0x100
+
 int	npumgmt_attach(struct npuep_facility *fac);
 void	npumgmt_detach(void);
 

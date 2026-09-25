@@ -153,6 +153,10 @@ struct npuep_softc {
 	bus_size_t		 giu_size;
 	bus_size_t		 nwa_off;	/* network agent facility, absolute in BAR0 */
 	bus_size_t		 nwa_size;
+	bus_size_t		 rpc_off;	/* the control-message channel, in the BAR2 window */
+	bus_size_t		 rpc_size;
+	uint32_t		 rpc_dump_off;	/* what the reader is looking at */
+	int			 rpc_dump_words;
 
 	int			 nvec;
 	int			 busmaster;	/* we turned it on, we turn it off */
@@ -329,6 +333,18 @@ npuep_read_barmap(struct npuep_softc *sc)
 		}
 
 		/*
+		 * The control-message channel, which is on BAR2 like the management facility.
+		 * Captured but not spoken to: see npuep.h for what is believed to be on the
+		 * other end of it, and note that nothing in this driver writes here.
+		 */
+		if (type == MV_FACILITY_RPC && bar == 1 &&
+		    size >= NPUEP_RPC_MIN_SIZE && size <= NPU_BARMAP_WINDOW_LEN &&
+		    off <= NPU_BARMAP_WINDOW_LEN - size && (off & 7) == 0) {
+			sc->rpc_off = sc->window + off;
+			sc->rpc_size = size;
+		}
+
+		/*
 		 * And the network agent's window, also on BAR0. This one decides whether the
 		 * front ports exist at all - see contrib/npuep/npunwa.c.
 		 */
@@ -482,6 +498,81 @@ npuep_setup_dbells(struct npuep_softc *sc)
 	return (0);
 }
 
+/*
+ * Read the control-message window, in words, from wherever you ask.
+ *
+ * Read only, and deliberately so. This is the one facility whose protocol we do not know, and the
+ * host module that speaks it is not in the vendor's source drop - so the only honest thing to do
+ * with it for now is look. Every other facility gave up its shape this way: the management window
+ * had a cookie, the network agent's had a cookie and a version gate, and both were recognisable
+ * from a hex dump long before a single byte was written back.
+ *
+ *	sysctl dev.npuep.0.rpc="0 40"     sixty-four words from the start of the window
+ *	sysctl -n dev.npuep.0.rpc
+ *
+ * Both numbers are hex.
+ */
+#define	NPUEP_RPC_DUMP_WORDS	256
+
+static int
+npuep_sysctl_rpc(SYSCTL_HANDLER_ARGS)
+{
+	struct npuep_softc *sc = arg1;
+	uint32_t v[NPUEP_RPC_DUMP_WORDS];
+	char in[64], *p, *end, *out;
+	u_long off, words;
+	int err, i, n = 0;
+
+	if (sc->rpc_size == 0)
+		return (ENXIO);
+
+	if (req->newptr != NULL) {
+		in[0] = '\0';
+		err = sysctl_handle_string(oidp, in, sizeof(in), req);
+		if (err != 0)
+			return (err);
+
+		p = in;
+		off = strtoul(p, &end, 16);
+		if (end == p)
+			return (EINVAL);
+		p = end;
+		while (*p == ' ' || *p == '\t' || *p == ',')
+			p++;
+		words = strtoul(p, &end, 16);
+		if (end == p || words == 0)
+			words = 16;
+		if (words > NPUEP_RPC_DUMP_WORDS)
+			words = NPUEP_RPC_DUMP_WORDS;
+		if ((off & 3) != 0 || off + words * 4 > (u_long)sc->rpc_size)
+			return (EINVAL);
+
+		sc->rpc_dump_off = (uint32_t)off;
+		sc->rpc_dump_words = (int)words;
+		return (0);
+	}
+
+	if (sc->rpc_dump_words == 0)
+		return (sysctl_handle_string(oidp, "", 1, req));
+
+	words = sc->rpc_dump_words;
+	off = sc->rpc_dump_off;
+	for (i = 0; i < (int)words; i++)
+		v[i] = bar2_read(sc, sc->rpc_off + off + i * 4);
+
+#define	NPUEP_RPC_OUT	(NPUEP_RPC_DUMP_WORDS * 10 + 128)
+	out = malloc(NPUEP_RPC_OUT, M_DEVBUF, M_WAITOK);
+	n = snprintf(out, NPUEP_RPC_OUT, "rpc window +0x%lx, %lu words:", off, words);
+	for (i = 0; i < (int)words && n < NPUEP_RPC_OUT - 16; i++)
+		n += snprintf(out + n, NPUEP_RPC_OUT - n, "%s%08x",
+		    (i % 8) == 0 ? "\n  " : " ", v[i]);
+
+	err = sysctl_handle_string(oidp, out, NPUEP_RPC_OUT, req);
+	free(out, M_DEVBUF);
+	return (err);
+#undef NPUEP_RPC_OUT
+}
+
 static void
 npuep_add_sysctls(struct npuep_softc *sc)
 {
@@ -500,6 +591,13 @@ npuep_add_sysctls(struct npuep_softc *sc)
 	 */
 	SYSCTL_ADD_U64(ctx, child, OID_AUTO, "handshake", CTLFLAG_RD,
 	    &sc->last_handshake, 0, "handshake word as last read by the heartbeat");
+
+	if (sc->rpc_size != 0) {
+		SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "rpc",
+		    CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0, npuep_sysctl_rpc, "A",
+		    "write \"offset words\" in hex, read back that part of the "
+		    "control-message window");
+	}
 
 	for (i = 0; i < NPUEP_TOTAL_DBELLS; i++) {
 		struct npuep_dbell *db = &sc->dbell[i];
