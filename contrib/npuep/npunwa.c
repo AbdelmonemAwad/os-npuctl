@@ -262,9 +262,21 @@ npunwa_xfer(struct npunwa_softc *sc, const uint32_t *req, int nreq, uint32_t *re
 		info->replylen = nwa_rd(sc, NWA_REPLY_LEN);
 	}
 
+	/*
+	 * Read only as far as the far side says it wrote. Reading the whole buffer regardless
+	 * meant a thousand MMIO reads across the link for a nine-byte answer, on every single
+	 * probe - pointless traffic over a window another processor is also using.
+	 */
 	if (reply != NULL) {
-		for (i = 0; i < nreply; i++)
+		int have = (int)nwa_rd(sc, NWA_REPLY_LEN);
+
+		have = (have > (int)NWA_RP_PAYLOAD) ? (have - (int)NWA_RP_PAYLOAD) / 4 : 0;
+		if (have > nreply)
+			have = nreply;
+		for (i = 0; i < have; i++)
 			reply[i] = nwa_rd(sc, rb + NWA_RP_PAYLOAD + 4 * i);
+		for (; i < nreply; i++)
+			reply[i] = 0;
 	}
 
 	nwa_wr(sc, NWA_TURN, NWA_TURN_ACK);
