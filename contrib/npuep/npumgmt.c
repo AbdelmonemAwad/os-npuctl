@@ -10,20 +10,30 @@
  * using physical addresses that we publish into a shared structure in BAR2.
  *
  * It is worth being clear about why this particular interface first, ahead of the fourteen
- * front ports. It is one facility, two rings and one doorbell each way - the smallest thing
- * that moves a packet, so the smallest thing that can prove the model. And it is the link every
- * Sophos diagnostic tool on the appliance talks over: xgs-cpld, xgs-ports, xgs-sff and the rest
- * are all ssh wrappers onto fe80::...%mvmgmt0. Bringing it up turns the vendor's own toolbox on.
+ * front ports. It is one facility and two rings - the smallest thing that moves a packet, so
+ * the smallest thing that can prove the model. And it is the link every Sophos diagnostic tool
+ * on the appliance talks over: their host-side xgs-* tools are mostly thin wrappers that ssh
+ * across it. Bringing it up turns the vendor's own toolbox on.
+ *
+ * NO DOORBELLS. The shipped driver forces dbell_nr to zero on both the receive and the transmit
+ * path - pcinet.c:1140 and 1152 - which sets polling on and peer notification off. Both sides
+ * then poll a 10 ms timer and nothing is ever rung. That reads like a debug hack left in, and
+ * it is what the published source does, so a port that waits for an interrupt here waits
+ * forever. The doorbell the mvmgmt facility is allocated is real and goes unused.
  *
  * WHAT IS DANGEROUS ABOUT IT
  *
  * This is the first time we hand the NPU addresses in host RAM and invite it to write there.
- * Everything up to now was the host reading and writing the endpoint's BARs, which can only
- * damage the endpoint. From here a wrong physical address, a wrong offset in the shared
- * structure, or an ownership bit read backwards means a coprocessor writing into memory that
- * belongs to something else - which is how this project already earned one general protection
- * fault. See docs/porting-notes.md. Nothing here is guessed: every offset and constant is
- * from the vendor's GPL pcinet source.
+ * Everything up to now was the host reading and writing the endpoint's BARs, where the worst
+ * case is a confused endpoint. From here a wrong physical address or a wrong offset in the
+ * shared structure is a coprocessor writing into memory that belongs to something else - which
+ * is how this project already earned one general protection fault. See docs/porting-notes.md.
+ *
+ * The target validates NOTHING it is given: it does not range-check the addresses, does not
+ * test them for zero, and never compares the sanity value against anything. Whatever is in
+ * those fields when link_status goes to HOST_UP is what it will write to.
+ *
+ * Nothing here is guessed. Every offset and constant is from the vendor's GPL pcinet source.
  */
 
 #include <sys/param.h>
@@ -61,14 +71,40 @@
 #define	PCINET_HOST_DEV_COMM_SANITY	0x01234567U
 
 /*
- * Linux uses NET_IP_ALIGN, which is 2 on x86: every buffer is shifted by two bytes so that the
- * IP header lands 4-byte aligned after the 14-byte Ethernet header. Both pbuf_virt AND
- * pbuf_phys are shifted, so the target sees the shifted address. FreeBSD calls the same
- * quantity ETHER_ALIGN. It must be replicated - the target does not know it happened, it just
- * uses the address it is given, and dropping it would silently misalign every received packet.
+ * The vendor shifts every buffer by NET_IP_ALIGN, in both its virtual and its physical view, so
+ * that an IP header lands 4-byte aligned after the 14-byte Ethernet header.
+ *
+ * On x86-64 Linux NET_IP_ALIGN is ZERO - unaligned access is cheap there, so the architecture
+ * defines the shift away and the vendor's arithmetic is a no-op on exactly the host this runs
+ * on. Adding a real two-byte shift here would move every published buffer address two bytes
+ * from where the vendor's host puts it. The target does not know the shift happened; it uses
+ * the address it is handed. So this is 0, deliberately, and the constant is kept rather than
+ * deleted because the code has to stay readable against the source it came from.
  */
-#define	PCINET_IP_ALIGN		2
+#define	PCINET_IP_ALIGN		0
 
+/*
+ * The coprocessor reaches host memory through a single outbound window that is a linear map of
+ * PCIe bus addresses [0, 64 GiB). The vendor host enforces the matching ceiling with
+ * dma_set_mask_and_coherent(DMA_BIT_MASK(36)) - facility_host.c:837.
+ *
+ * Every address published to the target must therefore be below 2^36. This is not a performance
+ * hint: an address above it maps to nothing the target can reach, and what it writes instead is
+ * undefined. It is the single most important constraint in this file.
+ */
+#define	NPUMGMT_DMA_LOWADDR	0xFFFFFFFFFULL	/* 36 bits */
+
+/*
+ * These two look like an ownership protocol and are not one.
+ *
+ * Across the whole vendor driver they appear in exactly four places - pcinet.c:261, 262, 446
+ * and 447 - and every one of them is an assignment. Nothing anywhere reads them. Ownership is
+ * carried entirely by the two ring indices; the status word is write-only telemetry.
+ *
+ * They are defined here because the values are real and a debugger will show them, but an
+ * implementation that waits on Q_ENTRY_STATUS_HOST_OWN before touching an entry will wait
+ * forever.
+ */
 #define	Q_ENTRY_STATUS_HOST_OWN	0x80000000U
 #define	Q_ENTRY_STATUS_FREE_SKB	0x01000000U
 
@@ -199,7 +235,7 @@ npumgmt_alloc_ring(device_t dev, bus_dma_tag_t parent, struct npumgmt_ring *r, i
 
 	r->size = size;
 
-	err = bus_dma_tag_create(parent, 8, 0, BUS_SPACE_MAXADDR, BUS_SPACE_MAXADDR,
+	err = bus_dma_tag_create(parent, 8, 0, NPUMGMT_DMA_LOWADDR, BUS_SPACE_MAXADDR,
 	    NULL, NULL, Q_STRUCT_SIZE, 1, Q_STRUCT_SIZE, 0, NULL, NULL, &r->ctl_tag);
 	if (err != 0)
 		return (err);
@@ -212,7 +248,7 @@ npumgmt_alloc_ring(device_t dev, bus_dma_tag_t parent, struct npumgmt_ring *r, i
 	if (err != 0 || r->ctl_phys == 0)
 		return (err != 0 ? err : ENOMEM);
 
-	err = bus_dma_tag_create(parent, 8, 0, BUS_SPACE_MAXADDR, BUS_SPACE_MAXADDR,
+	err = bus_dma_tag_create(parent, 8, 0, NPUMGMT_DMA_LOWADDR, BUS_SPACE_MAXADDR,
 	    NULL, NULL, (bus_size_t)QE_ENTRY_SIZE * size, 1,
 	    (bus_size_t)QE_ENTRY_SIZE * size, 0, NULL, NULL, &r->ent_tag);
 	if (err != 0)
@@ -226,7 +262,7 @@ npumgmt_alloc_ring(device_t dev, bus_dma_tag_t parent, struct npumgmt_ring *r, i
 	if (err != 0 || r->ent_phys == 0)
 		return (err != 0 ? err : ENOMEM);
 
-	err = bus_dma_tag_create(parent, 8, 0, BUS_SPACE_MAXADDR, BUS_SPACE_MAXADDR,
+	err = bus_dma_tag_create(parent, 8, 0, NPUMGMT_DMA_LOWADDR, BUS_SPACE_MAXADDR,
 	    NULL, NULL, PCINET_NET_BUF_SIZE, 1, PCINET_NET_BUF_SIZE, 0, NULL, NULL,
 	    &r->buf_tag);
 	if (err != 0)

@@ -27,8 +27,8 @@ At that point the coprocessor stops waiting and starts its own dataplane.
 
 **It does not move packets.** The management interface and the datapath that would carry the
 front ports are not implemented; the work in progress is in `contrib/npuep/npumgmt.c`, which is
-deliberately not in the build. See [DESIGN.md](DESIGN.md) for where the line currently is and
-what is on the other side of it.
+deliberately not in the build. [DESIGN.md](DESIGN.md) says where the line currently is;
+[docs/mvmgmt.md](docs/mvmgmt.md) is the specification the next piece is being written against.
 
 If you are looking for working ports today, this is not that yet. It is the part underneath it,
 and it is the part that had to exist first.

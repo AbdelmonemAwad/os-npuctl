@@ -94,6 +94,9 @@ This is the first point at which the host hands the coprocessor addresses in its
 stage 2 everything was the host reading and writing the endpoint's BARs, where the worst case is
 a confused endpoint.
 
+The specification it is being written against is [docs/mvmgmt.md](docs/mvmgmt.md), which also
+records three places where a straight transcription of the vendor driver would be wrong.
+
 It is the right next step and not the datapath, for three reasons: it is one facility rather
 than the whole GIU machinery, it is the smallest thing that can carry a packet and therefore
 prove the model, and it is the link the vendor's own diagnostic tools use - on the appliance,
