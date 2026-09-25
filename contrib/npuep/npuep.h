@@ -145,7 +145,8 @@ int	npuep_ring_dbell(struct npuep_softc *sc, int n);
  */
 #define	RPC_ST_CFG_MAGIC	0x00	/* u32 - the HOST writes this to open the channel */
 #define	  RPC_STATE_CFG_MAGIC	0xD7D3AB00U
-#define	RPC_ST_CFG_REVISION	0x04	/* u16 - the target publishes 1 */
+#define	RPC_ST_CFG_REVISION	0x04	/* u16 - written by the HOST, not the target */
+#define	  RPC_CFG_REVISION	0x015F	/* what the vendor's own host writes here */
 #define	RPC_ST_ACTIVE_HI_RINGS	0x06	/* u8  */
 #define	RPC_ST_RECONFIG_DONE	0x07	/* u8  */
 #define	RPC_ST_RING_LO		0x48	/* the low-priority ring */
