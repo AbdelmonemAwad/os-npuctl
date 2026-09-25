@@ -106,6 +106,36 @@ cookie rather than the handshake word, writing it back over itself unchanged. It
 running for several minutes and would not have been noticed otherwise, because every other
 indicator looked healthy.
 
+## if_init is not optional
+
+`if_alloc()` zeroes the ifnet. If a driver never calls `if_setinitfn()`, `ifp->if_init` stays
+NULL - and the stack calls it through a bare function pointer without checking.
+
+`in6_update_ifa()` does exactly that when an address is added to an interface that is up but not
+yet `IFF_DRV_RUNNING`. So the first `ifconfig mvmgmt0 inet6 ...` against a driver missing that one
+line is a call to address zero:
+
+```
+--- trap 0xc, rip = 0, rsp = 0xfffffe008b5f57d8 ---
+??() at 0/frame 0xfffffe008b5f5810
+in6_update_ifa() at in6_update_ifa+0x81f
+in6_ifattach() at in6_ifattach+0x7f5
+in6_if_up() at in6_if_up+0x7f
+nd6_ioctl() at nd6_ioctl+0x7ba
+ifioctl() at ifioctl+0x833
+current process = ifconfig,  fault virtual address = 0x0
+fault code = supervisor read instruction, page not present
+```
+
+Two things make this expensive to diagnose. The backtrace names only the network stack, so the
+driver that caused it is not in it. And `fault virtual address = 0x0` reads like a null *data*
+pointer, which sends you looking at buffers and DMA; the words that matter are **read
+instruction** and `rip = 0`, which say the CPU jumped to zero rather than dereferenced it.
+
+Worth stating plainly, because it happened here: this panic was first blamed on an unrelated
+ring-index hazard found by reading the code, and that guess was written up and published before
+the dump was read. The dump refuted it in one line. **Read the dump.**
+
 ## Reading the coprocessor's console
 
 See [npu-bring-up.md](npu-bring-up.md). Two rules, both learned by breaking them:
