@@ -19,6 +19,7 @@ written down, and so is the next contributor's.
 
 Exit status is 0 when clean, 1 when something must be replaced.
 """
+import ipaddress
 import pathlib
 import re
 import sys
@@ -52,7 +53,44 @@ SECRETS = (
 
 # A MAC that is not one of the documentation prefixes is somebody's actual hardware.
 MAC = re.compile(r'\b(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}\b')
-ALLOWED_MACS = ('00:00:00:', 'ff:ff:ff:', '01:00:5e:', '33:33:', 'de:ad:be:', '02:00:00:')
+# dc:ad:be: is not a typo. EUI-64 inverts bit 1 of the first octet, so the link-local of a
+# de:ad:be:.. documentation device unfolds to dc:ad:be:.. - and an example address has to be
+# allowed in the form it is actually written in.
+ALLOWED_MACS = ('00:00:00:', 'ff:ff:ff:', '01:00:5e:', '33:33:', 'de:ad:be:', 'dc:ad:be:',
+                '02:00:00:')
+
+# A MAC does not stop being a MAC because something reformatted it.
+#
+# An IPv6 link-local built by the EUI-64 rule carries the whole hardware address inside it: split
+# the interface identifier, drop the ff:fe inserted in the middle, flip bit 1 of the first byte,
+# and the original is back. fe80::7e5a:1cff:fexx:xxxx identifies a machine exactly as well as the
+# colon-separated form does, and the MAC pattern above cannot see it, because the bytes have been
+# regrouped into 16-bit hextets.
+#
+# This is not hypothetical. Every interface on the appliance this repository documents
+# autoconfigures one of these, so they land in any ifconfig or ping6 output pasted into a note -
+# and one was published in a pull request comment on this repository before this check existed.
+#
+# So the address is unfolded and the recovered MAC is put through exactly the same allow list as
+# a written-out one. That keeps one rule instead of two: fe80::1 and fe80::2 carry no interface
+# identifier at all and pass, the link-local of an allowed 02:00:00:.. address passes, and only a
+# real machine's is refused. Judging the shape instead would reject this project's own documented
+# examples, and a check that cries wolf gets switched off.
+EUI64_LL = re.compile(r'\bfe80:[0-9a-fA-F:]{2,}', re.IGNORECASE)
+
+
+def folded_mac(token):
+    """The MAC inside an EUI-64 link-local, or None if there is not one in there."""
+    try:
+        packed = ipaddress.IPv6Address(token.rstrip(':')).packed
+    except ValueError:
+        return None
+    eui = packed[8:]
+    if eui[3] != 0xFF or eui[4] != 0xFE:
+        return None
+    # bit 1 of the first byte is inverted on the way in, so invert it on the way out
+    octets = (eui[0] ^ 0x02, eui[1], eui[2], eui[5], eui[6], eui[7])
+    return ':'.join('%02x' % o for o in octets)
 
 SKIP_DIRS = {'.git', '__pycache__', 'node_modules'}
 BINARY = {'.png', '.jpg', '.jpeg', '.gif', '.mo', '.ico', '.pdf', '.zip', '.gz'}
@@ -105,6 +143,10 @@ def complaints(path, text):
         for found in MAC.findall(line):
             if not found.lower().startswith(ALLOWED_MACS):
                 yield (number, 'a MAC address belonging to real hardware')
+        for match in EUI64_LL.finditer(line):
+            folded = folded_mac(match.group(0))
+            if folded is not None and not folded.startswith(ALLOWED_MACS):
+                yield (number, 'an IPv6 link-local address with a real MAC folded into it')
         for pattern, what in SECRETS:
             if pattern.search(line):
                 yield (number, what)

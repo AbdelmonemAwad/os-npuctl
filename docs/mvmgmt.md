@@ -188,4 +188,27 @@ they are freed, and a reset of the coprocessor is the only thing that makes that
 - Whether a FreeBSD host with an active IOMMU produces bus addresses under 2^36 when the busdma
   tag asks for them. The target adds the published address to a linear window, so whatever the
   host publishes has to be exactly what appears on the bus.
-- Nothing in this source ever reads `remote_mac` or the two cookie bytes in the MAC union.
+## remote_mac is dead, and that is measured
+
+Nothing in the vendor source ever reads `remote_mac` or the two cookie bytes in the MAC union,
+and nothing writes it either. A dump of the live window on this appliance, taken after
+`LINK_ESTABLISHED` with traffic flowing, settles it:
+
+```
++0x00  80 bf f4 cd 01 00 00 00     rx_q_phys
++0x08  40 a0 f4 cd 01 00 00 00     tx_q_phys
++0x10  83 00 00 00 01 00 00 00     link_status = 0x83, link_change = 1
++0x18  00 00 00 00 00 00 00 00
++0x20  00 00 00 00 00 00 00 00     remote_mac
+```
+
+So a host cannot learn the coprocessor's address from this field, and must not wait for it. It
+should read the field in case a later firmware fills it in - as six bytes from the start, which
+is where a `u8 mac[6]` at `+0x20` puts them - and otherwise give itself a locally administered
+address of its own. Deriving that from something stable and per-unit is worth the few lines: a
+constant is identical on every appliance, which costs nothing until the interface is bridged and
+then costs an afternoon.
+
+The coprocessor does have an address, and it is a real one in Sophos's OUI, stable across both a
+host reboot and an NPU reset. It is simply never advertised here; the only way to learn it is
+ordinary neighbour discovery over the link.
