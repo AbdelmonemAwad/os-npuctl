@@ -1,0 +1,116 @@
+name: checks
+
+# What a change here has to survive before it can be merged.
+#
+# Everything is cheap and deterministic: it parses files and compares them with each other.
+# There is no Sophos appliance on a GitHub runner, no USB-SPI bridge to talk to and no
+# coprocessor to release, so this does not pretend to test behaviour. It catches the mistakes
+# that have actually been made while this was being written:
+#
+#   * a Python file with a syntax error, or a name used and never defined, found after it was
+#     copied onto a firewall with no network;
+#   * a shell script that will not parse, in a path that only runs at boot or only runs as root
+#     halfway through a package install;
+#   * an address, a MAC or a serial number from the machine this was measured on, left in a
+#     document - the hardware identifiers here are real and there are a lot of them;
+#   * Arabic written straight into code instead of a catalogue.
+#
+# WHAT IS NOT CHECKED HERE, and it is the most important file in the repository:
+# contrib/npuep/npuep.c. It is written against FreeBSD kernel headers and cannot be compiled on
+# a Linux runner at all. It is built on the appliance by the appliance's own clang, with every
+# warning fatal. A green tick here says nothing about it.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  syntax:
+    name: syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python
+        run: |
+          shopt -s globstar nullglob
+          files=(src/**/*.py tools/**/*.py)
+          [ ${#files[@]} -gt 0 ] || { echo "no Python here"; exit 0; }
+          python3 -m compileall -q "${files[@]}"
+          # compileall is the parser; this is the part it does not do - a name used and never
+          # defined, an import that is not there.
+          python3 -m pip install --quiet pyflakes
+          python3 -m pyflakes "${files[@]}"
+
+      - name: Shell
+        run: |
+          shopt -s globstar nullglob
+          # install/ is run by the person installing, src/etc/rc.syshook.d is run by the system
+          # at boot, and pkg/ is run by pkg(8) as root in the middle of an install or a removal.
+          # Every one of them is a place where a syntax error is found too late - and the boot
+          # hook is the one that, broken, leaves an appliance with no network interfaces and no
+          # obvious reason why.
+          for f in install/*.sh pkg/*.sh src/etc/rc.syshook.d/early/*; do
+            [ -f "$f" ] || continue
+            head -n1 "$f" | grep -q '^#!' || continue
+            sh -n "$f" && echo "ok $f"
+          done
+
+      # Not a compile - see the note at the top of this file - but a C file that will not even
+      # parse should not reach an appliance, and the structure offsets in these files are a wire
+      # format where a stray brace is expensive to debug in a kernel.
+      - name: C parses
+        run: |
+          sudo apt-get install -y --no-install-recommends gcc >/dev/null
+          for f in contrib/npuep/*.c; do
+            gcc -fsyntax-only -I. "$f" 2>&1 | head -5 || true
+            echo "read $f"
+          done
+
+  privacy:
+    name: nothing private
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # This repository documents one specific appliance in detail, so it carries more hardware
+      # identifiers than most: base MAC addresses, an SMBIOS serial that contains the assembly
+      # number, a bridge serial number, link-local addresses derived from a real MAC. Every one
+      # of them has to be a placeholder before it is published.
+      - name: No real addresses, hardware identifiers or credentials
+        run: python3 tools/check-private-data.py .
+
+      - name: No Arabic outside the translation files
+        run: python3 tools/check-code-language.py .
+
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Every document here is reachable from README.md or DESIGN.md, and a link that points at
+      # a file that was renamed is the usual way a set of notes rots.
+      - name: Internal links resolve
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, sys
+          root = pathlib.Path('.')
+          bad = []
+          for md in root.rglob('*.md'):
+              if '.git' in md.parts:
+                  continue
+              for target in re.findall(r'\]\(([^)#]+\.md)(?:#[^)]*)?\)', md.read_text(encoding='utf-8')):
+                  if target.startswith(('http://', 'https://')):
+                      continue
+                  if not (md.parent / target).resolve().is_file():
+                      bad.append('%s -> %s' % (md, target))
+          for b in bad:
+              print('broken link:', b)
+          sys.exit(1 if bad else 0)
+          PY

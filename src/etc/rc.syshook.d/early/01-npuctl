@@ -1,0 +1,54 @@
+#!/bin/sh
+# Release the Marvell NPU from reset. Numbered 01 so it runs before every other early hook:
+# on these boards there are no network interfaces at all until this has happened.
+#
+# On a Sophos XGS the NPU owns every front port, and it comes out of power-on HELD: the MCP2210
+# USB-to-SPI bridge loads its factory NVRAM pin state, which for the 126/136 is GP3=1, GP5=0,
+# and that keeps the NPU in reset. SFOS releases it somewhere in its own startup. Nothing in
+# OPNsense does, which is why this appliance booted with a completely silent NPU and no ports.
+#
+# It has to be a PULSE - hold, then release - and not simply a write of the release state.
+# That was measured, not assumed: on a cold boot this hook wrote the release values, the pins
+# read back exactly right, and the NPU stayed dead with ZERO receive interrupts on its console.
+# Driving the pins high and then low starts it every time. What the part wants is an edge, not
+# a level.
+#
+# And it is written to the bridge's VOLATILE settings only, so it does not survive a power
+# cycle - which is why this runs on every boot rather than being a one-off.
+#
+# Deliberately quiet and deliberately harmless on the wrong hardware: if the bridge is not
+# there, or the board is not one whose pin values we know, it logs and exits 0. This runs on
+# every boot of every machine the plugin is installed on, so it must never be the reason a
+# firewall fails to come up.
+
+: ${NPUCTL:=/usr/local/opnsense/scripts/npuctl/mcp2210.py}
+
+log() { /usr/bin/logger -t npuctl -p daemon.notice "$1"; }
+
+# hidraw(4) is what gives us /dev/hidraw0 for the bridge. hidbus attaches on its own but leaves
+# no device node until a child driver claims it.
+if ! /sbin/kldstat -q -m hidraw; then
+    /sbin/kldload hidraw 2>/dev/null
+fi
+
+if [ ! -c /dev/hidraw0 ]; then
+    log "no /dev/hidraw0 - no MCP2210 bridge on this machine, nothing to do"
+    exit 0
+fi
+
+if [ ! -f "${NPUCTL}" ]; then
+    log "missing ${NPUCTL}"
+    exit 0
+fi
+
+out=$(/usr/local/bin/python3 "${NPUCTL}" pulse 2>&1)
+rc=$?
+if [ ${rc} -eq 0 ]; then
+    log "NPU reset pulsed: ${out}"
+else
+    # Not fatal. A firewall that boots without its NPU is still a firewall you can log into and
+    # fix; one that refuses to boot is not.
+    log "NPU reset pulse FAILED (rc=${rc}): ${out}"
+fi
+
+exit 0

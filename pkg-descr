@@ -1,0 +1,16 @@
+Bring the Marvell network processor out of reset on Sophos XGS appliances.
+
+On these boards every front port belongs to a Marvell CN913x coprocessor behind a PCIe
+endpoint, and that coprocessor comes out of power-on held in reset by a USB-to-SPI bridge whose
+factory pin state is "held". The vendor firmware releases it during its own startup. Without
+that step the coprocessor never boots, its serial console never says a word, and the appliance
+has no network interfaces at all.
+
+This plugin performs that release on every boot, before anything expects interfaces to exist.
+The pin values are per board model and are read from the bridge's own EEPROM, so it acts only
+on hardware it recognises and does nothing at all on anything else.
+
+It also ships the kernel module that completes the handshake the coprocessor waits for, as
+source, to be built and loaded deliberately rather than automatically.
+
+WWW: https://github.com/AbdelmonemAwad/os-npuctl
