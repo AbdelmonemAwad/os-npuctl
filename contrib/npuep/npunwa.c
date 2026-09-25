@@ -330,7 +330,6 @@ int
 npunwa_attach(struct npuep_facility *fac)
 {
 	struct npunwa_softc *sc;
-	int err;
 
 	if (npunwa_sc != NULL)
 		return (EBUSY);
@@ -351,13 +350,12 @@ npunwa_attach(struct npuep_facility *fac)
 	callout_reset(&sc->ready, NPUNWA_READY_RETRY, npunwa_ready_tick, sc);
 	mtx_unlock(&sc->mtx);
 
+	/*
+	 * Nothing here can fail any more. Everything that could - the cookie, the version, the
+	 * maximum request length - reads a value the far side has not published yet, so all of it
+	 * lives behind the callout and reports itself there.
+	 */
 	return (0);
-
-fail:
-	callout_drain(&sc->ready);
-	mtx_destroy(&sc->mtx);
-	free(sc, M_DEVBUF);
-	return (err);
 }
 
 void
