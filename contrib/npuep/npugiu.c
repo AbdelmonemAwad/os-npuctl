@@ -54,6 +54,7 @@
 #include <sys/mutex.h>
 #include <sys/sysctl.h>
 #include <sys/systm.h>
+#include <sys/endian.h>
 
 #include <machine/atomic.h>
 #include <machine/bus.h>
@@ -80,12 +81,31 @@
 
 #define	NPUGIU_DMA_LOWADDR	0xFFFFFFFFFULL	/* 36 bits - see docs/mvmgmt.md */
 
+/*
+ * One traffic class each way with one queue in it - what the vendor's module defaults to, and
+ * the smallest configuration that can carry a packet. Sophos runs four queues per class; that is
+ * a tuning decision and belongs after this works at all.
+ *
+ * The buffer has to hold an Ethernet frame AND the sixty-six bytes the coprocessor prepends -
+ * two for the port identifier and sixty-four of metadata. See docs/giu.md.
+ */
+#define	NPUGIU_DATA_Q_LEN	256
+#define	NPUGIU_BUF_SIZE		2048
+#define	NPUGIU_MTU		1500
+
+struct npugiu_buf {
+	bus_dmamap_t	 map;
+	void		*vaddr;
+	bus_addr_t	 paddr;
+};
+
 struct npugiu_ring {
 	bus_dma_tag_t	 tag;
 	bus_dmamap_t	 map;
 	void		*desc;		/* NPUGIU_*_Q_LEN * AGNIC_CMD_DESC_SIZE */
 	bus_addr_t	 phys;
 	int		 len;
+	int		 descsz;
 
 	uint32_t	 prod_slot;	/* BAR-relative offset of our producer word */
 	uint32_t	 cons_slot;	/* and of our consumer word */
@@ -106,6 +126,16 @@ struct npugiu_softc {
 
 	struct npugiu_ring	 cmd;
 	struct npugiu_ring	 notif;
+
+	/* the datapath: one transmit ring, one receive ring, one buffer pool */
+	struct npugiu_ring	 tx;
+	struct npugiu_ring	 rx;
+	struct npugiu_ring	 bp;
+
+	bus_dma_tag_t		 buf_tag;
+	struct npugiu_buf	*buf;
+	int			 nbuf;
+	int			 datapath;	/* the bring-up sequence completed */
 
 	uint16_t		 next_tag;
 	uint8_t			 mac[6];
@@ -186,7 +216,7 @@ idx_remote(struct npugiu_softc *sc, uint32_t slot_off, int len, uint32_t *out)
 static __inline uint8_t *
 desc_at(struct npugiu_ring *r, uint32_t i)
 {
-	return ((uint8_t *)r->desc + (size_t)i * AGNIC_CMD_DESC_SIZE);
+	return ((uint8_t *)r->desc + (size_t)i * (size_t)r->descsz);
 }
 
 static __inline uint32_t
@@ -250,12 +280,14 @@ npugiu_dmamap_cb(void *arg, bus_dma_segment_t *segs, int nseg, int error)
 }
 
 static int
-npugiu_alloc_ring(struct npugiu_softc *sc, struct npugiu_ring *r, int len, const char *what)
+npugiu_alloc_ring(struct npugiu_softc *sc, struct npugiu_ring *r, int len, int descsz,
+    const char *what)
 {
-	bus_size_t bytes = (bus_size_t)len * AGNIC_CMD_DESC_SIZE;
+	bus_size_t bytes = (bus_size_t)len * descsz;
 	int err;
 
 	r->len = len;
+	r->descsz = descsz;
 	r->shadow = 0;
 	r->prod_idx = r->cons_idx = -1;
 
@@ -281,7 +313,7 @@ npugiu_alloc_ring(struct npugiu_softc *sc, struct npugiu_ring *r, int len, const
 
 	device_printf(sc->fac.dev,
 	    "giu: %s ring %d x %d B @ %#jx, indices at BAR+%#x and BAR+%#x\n",
-	    what, len, AGNIC_CMD_DESC_SIZE, (uintmax_t)r->phys,
+	    what, len, descsz, (uintmax_t)r->phys,
 	    (unsigned)(sc->fac.off + r->prod_slot), (unsigned)(sc->fac.off + r->cons_slot));
 	return (0);
 }
@@ -469,6 +501,191 @@ npugiu_command(struct npugiu_softc *sc, uint8_t code, const void *params, size_t
  * Bring-up.
  * ---------------------------------------------------------------------------------------
  */
+
+/*
+ * ---------------------------------------------------------------------------------------
+ * The datapath: buffers, and the bring-up sequence that hands it all to the coprocessor.
+ * ---------------------------------------------------------------------------------------
+ */
+static void
+npugiu_free_buffers(struct npugiu_softc *sc)
+{
+	int i;
+
+	if (sc->buf != NULL) {
+		for (i = 0; i < sc->nbuf; i++) {
+			if (sc->buf[i].vaddr == NULL)
+				continue;
+			bus_dmamap_unload(sc->buf_tag, sc->buf[i].map);
+			bus_dmamem_free(sc->buf_tag, sc->buf[i].vaddr, sc->buf[i].map);
+			sc->buf[i].vaddr = NULL;
+		}
+		free(sc->buf, M_DEVBUF);
+		sc->buf = NULL;
+	}
+	if (sc->buf_tag != NULL) {
+		bus_dma_tag_destroy(sc->buf_tag);
+		sc->buf_tag = NULL;
+	}
+	sc->nbuf = 0;
+}
+
+static int
+npugiu_alloc_buffers(struct npugiu_softc *sc, int n)
+{
+	int i, err;
+
+	err = bus_dma_tag_create(sc->fac.parent_tag, 64, 0, NPUGIU_DMA_LOWADDR,
+	    BUS_SPACE_MAXADDR, NULL, NULL, NPUGIU_BUF_SIZE, 1, NPUGIU_BUF_SIZE, 0,
+	    NULL, NULL, &sc->buf_tag);
+	if (err != 0)
+		return (err);
+
+	sc->buf = malloc(sizeof(*sc->buf) * n, M_DEVBUF, M_WAITOK | M_ZERO);
+	sc->nbuf = n;
+
+	for (i = 0; i < n; i++) {
+		bus_addr_t pa = 0;
+
+		err = bus_dmamem_alloc(sc->buf_tag, &sc->buf[i].vaddr,
+		    BUS_DMA_WAITOK | BUS_DMA_ZERO | BUS_DMA_COHERENT, &sc->buf[i].map);
+		if (err != 0)
+			return (err);
+		err = bus_dmamap_load(sc->buf_tag, sc->buf[i].map, sc->buf[i].vaddr,
+		    NPUGIU_BUF_SIZE, npugiu_dmamap_cb, &pa, BUS_DMA_NOWAIT);
+		if (err != 0 || pa == 0)
+			return (err != 0 ? err : ENOMEM);
+		sc->buf[i].paddr = pa;
+	}
+	return (0);
+}
+
+/*
+ * Fill the buffer pool, and publish the producer index LAST.
+ *
+ * The vendor hands the pool's address to the device while it is still empty and fills it
+ * afterwards; that works only because the device has not been enabled yet. Filling before the
+ * enable removes the window entirely. The one slot left between producer and consumer is what
+ * keeps full and empty distinguishable - the same rule as every other ring here.
+ */
+static void
+npugiu_fill_bpool(struct npugiu_softc *sc)
+{
+	struct npugiu_ring *r = &sc->bp;
+	int i, fill = r->len - 1;
+
+	mtx_assert(&sc->mtx, MA_OWNED);
+
+	if (fill > sc->nbuf)
+		fill = sc->nbuf;
+
+	for (i = 0; i < fill; i++) {
+		uint8_t *d = desc_at(r, (uint32_t)i);
+
+		le64enc(d + AGNIC_BPD_BUFF_ADDR_PHYS, (uint64_t)sc->buf[i].paddr);
+		/*
+		 * The cookie is ours and comes back untouched. The vendor puts a kernel virtual
+		 * pointer here, so any corruption on the far side becomes an arbitrary
+		 * dereference. An index cannot do that.
+		 */
+		le64enc(d + AGNIC_BPD_BUFF_COOKIE, (uint64_t)i);
+	}
+
+	idx_wr(sc, r->cons_slot, 0);
+	r->shadow = (uint32_t)fill;
+	idx_publish(sc, r->prod_slot, r->shadow);
+
+	device_printf(sc->fac.dev, "giu: buffer pool filled with %d of %d x %d B\n",
+	    fill, r->len, NPUGIU_BUF_SIZE);
+}
+
+/*
+ * The bring-up sequence, in the order the code requires rather than the order the header
+ * suggests. Every step waits for its answer, because a queue the device did not accept is a
+ * queue it will not read - and the vendor ignores these returns.
+ */
+static int
+npugiu_bringup(struct npugiu_softc *sc)
+{
+	uint8_t p[AGNIC_MGMT_DESC_DATA_LEN];
+	int err;
+
+	mtx_assert(&sc->mtx, MA_OWNED);
+
+#define	STEP(code, len, what)						\
+	do {								\
+		err = npugiu_command(sc, (code), p, (len));		\
+		if (err != 0) {						\
+			device_printf(sc->fac.dev,			\
+			    "giu: %s failed (%d)\n", (what), err);	\
+			return (err);					\
+		}							\
+	} while (0)
+
+	/* 1. how many traffic classes, and how the egress scheduler behaves */
+	memset(p, 0, sizeof(p));
+	le32enc(p + AGNIC_P_INIT_NUM_EGRESS_TC, 1);
+	le32enc(p + AGNIC_P_INIT_NUM_INGRESS_TC, 1);
+	le16enc(p + AGNIC_P_INIT_MTU_OVERRIDE, NPUGIU_MTU);
+	le16enc(p + AGNIC_P_INIT_MRU_OVERRIDE, NPUGIU_MTU);
+	p[AGNIC_P_INIT_EGRESS_SCHED] = AGNIC_ES_STRICT_SCHED;
+	STEP(AGNIC_CC_PF_INIT, 0x10, "PF_INIT");
+
+	/* 2. the ingress class */
+	memset(p, 0, sizeof(p));
+	le32enc(p + AGNIC_P_ITC_TC, 0);
+	le32enc(p + AGNIC_P_ITC_NUM_QUEUES, 1);
+	le32enc(p + AGNIC_P_ITC_PKT_OFFSET, 0);
+	p[AGNIC_P_ITC_HASH_TYPE] = AGNIC_ING_HASH_NONE;
+	STEP(AGNIC_CC_PF_INGRESS_TC_ADD, 0x10, "INGRESS_TC_ADD");
+
+	/* 3. the receive queue, which carries its buffer pool with it */
+	memset(p, 0, sizeof(p));
+	le64enc(p + AGNIC_P_IQ_PHYS_ADDR, (uint64_t)sc->rx.phys);
+	le32enc(p + AGNIC_P_IQ_PROD_OFFS, sc->rx.prod_slot);
+	le32enc(p + AGNIC_P_IQ_CONS_OFFS, sc->rx.cons_slot);
+	le64enc(p + AGNIC_P_IQ_BPOOL_PHYS_ADDR, (uint64_t)sc->bp.phys);
+	le32enc(p + AGNIC_P_IQ_BPOOL_PROD_OFFS, sc->bp.prod_slot);
+	le32enc(p + AGNIC_P_IQ_BPOOL_CONS_OFFS, sc->bp.cons_slot);
+	le32enc(p + AGNIC_P_IQ_LEN, (uint32_t)sc->rx.len);
+	le32enc(p + AGNIC_P_IQ_MSIX_ID, (uint32_t)sc->fac.first_msix);
+	le32enc(p + AGNIC_P_IQ_TC, 0);
+	le32enc(p + AGNIC_P_IQ_BUF_SIZE, NPUGIU_BUF_SIZE);
+	STEP(AGNIC_CC_PF_INGRESS_DATA_Q_ADD, 0x30, "INGRESS_DATA_Q_ADD");
+
+	/* 4. the egress class */
+	memset(p, 0, sizeof(p));
+	le32enc(p + AGNIC_P_ETC_TC, 0);
+	le32enc(p + AGNIC_P_ETC_NUM_QUEUES, 1);
+	le32enc(p + AGNIC_P_ETC_NUM_Q_PER_DMA, 1);
+	STEP(AGNIC_CC_PF_EGRESS_TC_ADD, 0x0c, "EGRESS_TC_ADD");
+
+	/* 5. the transmit queue */
+	memset(p, 0, sizeof(p));
+	le64enc(p + AGNIC_P_EQ_PHYS_ADDR, (uint64_t)sc->tx.phys);
+	le32enc(p + AGNIC_P_EQ_PROD_OFFS, sc->tx.prod_slot);
+	le32enc(p + AGNIC_P_EQ_CONS_OFFS, sc->tx.cons_slot);
+	le32enc(p + AGNIC_P_EQ_LEN, (uint32_t)sc->tx.len);
+	le32enc(p + AGNIC_P_EQ_WRR_WEIGHT, 1);
+	le32enc(p + AGNIC_P_EQ_TC, 0);
+	le32enc(p + AGNIC_P_EQ_MSIX_ID, (uint32_t)(sc->fac.first_msix + 1));
+	STEP(AGNIC_CC_PF_EGRESS_DATA_Q_ADD, 0x20, "EGRESS_DATA_Q_ADD");
+
+	/* 6. and that is the configuration */
+	memset(p, 0, sizeof(p));
+	STEP(AGNIC_CC_PF_INIT_DONE, 0, "INIT_DONE");
+
+	/* 7. buffers before the enable, never after */
+	npugiu_fill_bpool(sc);
+
+	memset(p, 0, sizeof(p));
+	STEP(AGNIC_CC_PF_ENABLE, 0, "PF_ENABLE");
+
+#undef STEP
+	sc->datapath = 1;
+	return (0);
+}
+
 static int
 npugiu_wait_status(struct npugiu_softc *sc, uint32_t bit, int ticks, const char *what)
 {
@@ -549,10 +766,10 @@ npugiu_attach(struct npuep_facility *fac)
 
 	npugiu_init_slots(sc);
 
-	err = npugiu_alloc_ring(sc, &sc->cmd, NPUGIU_CMD_Q_LEN, "command");
+	err = npugiu_alloc_ring(sc, &sc->cmd, NPUGIU_CMD_Q_LEN, AGNIC_CMD_DESC_SIZE, "command");
 	if (err != 0)
 		goto fail;
-	err = npugiu_alloc_ring(sc, &sc->notif, NPUGIU_NOTIF_Q_LEN, "notification");
+	err = npugiu_alloc_ring(sc, &sc->notif, NPUGIU_NOTIF_Q_LEN, AGNIC_CMD_DESC_SIZE, "notification");
 	if (err != 0)
 		goto fail;
 
@@ -595,9 +812,41 @@ npugiu_attach(struct npuep_facility *fac)
 	}
 
 	device_printf(fac->dev, "giu: MGMT_ECHO answered - the command channel is up\n");
+
+	/*
+	 * With the channel proved, hand over the datapath. Its failure leaves the command channel
+	 * running, which is worth keeping: it is what a later attempt would need anyway, and a
+	 * machine that keeps it is easier to work on than one that tears everything down.
+	 */
+	GIU_LOCK(sc);
+	err = npugiu_alloc_ring(sc, &sc->tx, NPUGIU_DATA_Q_LEN, AGNIC_TXD_SIZE, "transmit");
+	if (err == 0)
+		err = npugiu_alloc_ring(sc, &sc->rx, NPUGIU_DATA_Q_LEN, AGNIC_RXD_SIZE, "receive");
+	if (err == 0)
+		err = npugiu_alloc_ring(sc, &sc->bp, NPUGIU_DATA_Q_LEN, AGNIC_BPD_SIZE,
+		    "buffer pool");
+	if (err == 0)
+		err = npugiu_alloc_buffers(sc, NPUGIU_DATA_Q_LEN);
+	if (err == 0)
+		err = npugiu_bringup(sc);
+	GIU_UNLOCK(sc);
+
+	if (err != 0)
+		device_printf(fac->dev,
+		    "giu: the datapath did not come up (%d) - the command channel is still "
+		    "running\n", err);
+	else
+		device_printf(fac->dev,
+		    "giu: datapath enabled - 1 tc each way, %d descriptors, %d buffers\n",
+		    NPUGIU_DATA_Q_LEN, NPUGIU_DATA_Q_LEN);
+
 	return (0);
 
 fail:
+	npugiu_free_buffers(sc);
+	npugiu_free_ring(sc, &sc->bp);
+	npugiu_free_ring(sc, &sc->rx);
+	npugiu_free_ring(sc, &sc->tx);
 	npugiu_free_ring(sc, &sc->notif);
 	npugiu_free_ring(sc, &sc->cmd);
 	callout_drain(&sc->poll);
@@ -639,6 +888,10 @@ npugiu_detach(void)
 		cfg_wr(sc, AGNIC_CFG_NOTIF_Q + AGNIC_QI_LEN, 0);
 		bus_barrier(sc->fac.res, sc->fac.off, AGNIC_CFG_SIZE, BUS_SPACE_BARRIER_WRITE);
 
+		npugiu_free_buffers(sc);
+		npugiu_free_ring(sc, &sc->bp);
+		npugiu_free_ring(sc, &sc->rx);
+		npugiu_free_ring(sc, &sc->tx);
 		npugiu_free_ring(sc, &sc->notif);
 		npugiu_free_ring(sc, &sc->cmd);
 	} else {
