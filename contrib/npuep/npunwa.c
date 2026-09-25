@@ -40,6 +40,7 @@
 #include <sys/mutex.h>
 #include <sys/sysctl.h>
 #include <sys/systm.h>
+#include <sys/taskqueue.h>
 
 #include <machine/bus.h>
 #include <machine/resource.h>
@@ -86,9 +87,27 @@ struct npunwa_port {
 struct npunwa_softc {
 	struct npuep_facility	 fac;
 	struct mtx		 mtx;
-	struct callout		 ready;
+	/*
+	 * A taskqueue thread, not a callout, and the reason is the wait above: every step here
+	 * talks to the mailbox, every mailbox transaction sleeps, and a callout handler is not a
+	 * place where sleeping is allowed. Under callout_init_mtx it is worse than not allowed -
+	 * a thirty-second reply wait would stall every other callout on the machine.
+	 */
+	struct taskqueue	*tq;
+	struct timeout_task	 task;
 	int			 tries;
+	/*
+	 * Two flags, not one, and the difference matters. running says the driver is alive and a
+	 * mailbox wait is allowed to wait. stop says the periodic task must not run again and must
+	 * not requeue itself. Detach needs to stop the task while still being allowed to use the
+	 * mailbox itself, to put the ports back down - one flag cannot express that, and trying to
+	 * make it do so wedged an unload inside taskqueue_free waiting for a thread that kept
+	 * being handed new work.
+	 */
 	int			 running;
+	int			 stop;
+	int			 ready;		/* the mailbox has been found and validated */
+	int			 busy;		/* a transaction is in the window */
 	int			 sweep;		/* which port the link poll looks at next */
 	uint32_t		 body;		/* NWA_BODY_OFF's value, also the gate */
 	uint32_t		 max_req;
@@ -122,12 +141,26 @@ nwa_wait(struct npunwa_softc *sc, bus_size_t off, uint32_t want, int ticks)
 {
 	int i;
 
+	mtx_assert(&sc->mtx, MA_OWNED);
+
 	for (i = 0; i < ticks; i++) {
-		if (nwa_rd(sc, off) == want)
+		uint32_t v = nwa_rd(sc, off);
+
+		if (v == want)
 			return (0);
-		if (nwa_rd(sc, off) == 0xFFFFFFFFU)
+		if (v == 0xFFFFFFFFU)
 			return (ENXIO);		/* the endpoint stopped decoding */
-		pause("npunwa", hz / 100);
+		if (!sc->running)
+			return (ENXIO);		/* detach is waiting; do not make it wait */
+
+		/*
+		 * msleep releases the mutex for the duration of the sleep. pause does not, and
+		 * that difference is the whole of "panic: sleeping thread holds npunwa": any
+		 * other thread that then blocks on this mutex walks into propagate_priority(),
+		 * finds the owner asleep, and takes the machine down. It took an unload racing
+		 * the link poll to show it, which is to say it took four hours of not showing.
+		 */
+		msleep(&sc->busy, &sc->mtx, 0, "npunwa", hz / 100);
 	}
 	return (ETIMEDOUT);
 }
@@ -140,7 +173,7 @@ nwa_wait(struct npunwa_softc *sc, bus_size_t off, uint32_t want, int ticks)
  * a caller receives only payload.
  */
 static int
-npunwa_command(struct npunwa_softc *sc, uint32_t op, uint32_t sub, uint32_t port,
+npunwa_transact(struct npunwa_softc *sc, uint32_t op, uint32_t sub, uint32_t port,
     uint32_t payload, uint32_t *reply, int nreply)
 {
 	bus_size_t rb;
@@ -208,6 +241,34 @@ npunwa_command(struct npunwa_softc *sc, uint32_t op, uint32_t sub, uint32_t port
 	return (0);
 }
 
+/*
+ * The window holds exactly one transaction, and now that the wait above releases the mutex there
+ * is a gap in which a second caller could start one. There is only one caller today - the task
+ * below - but a mailbox that is single-writer by luck rather than by construction is not worth
+ * the next person's afternoon.
+ */
+static int
+npunwa_command(struct npunwa_softc *sc, uint32_t op, uint32_t sub, uint32_t port,
+    uint32_t payload, uint32_t *reply, int nreply)
+{
+	int err;
+
+	mtx_assert(&sc->mtx, MA_OWNED);
+
+	while (sc->busy) {
+		if (!sc->running)
+			return (ENXIO);
+		msleep(&sc->busy, &sc->mtx, 0, "npunwaq", hz / 10);
+	}
+
+	sc->busy = 1;
+	err = npunwa_transact(sc, op, sub, port, payload, reply, nreply);
+	sc->busy = 0;
+	wakeup(&sc->busy);
+
+	return (err);
+}
+
 /* Set a port's administrative state. This is the one that lights the LED. */
 static int
 npunwa_port_set_state(struct npunwa_softc *sc, int n, int up)
@@ -272,17 +333,14 @@ npunwa_bring_up(struct npunwa_softc *sc)
  * One port per tick. Reports a change and nothing else, so the log says when a cable moved rather
  * than repeating itself once a second forever.
  */
-static void
-npunwa_link_tick(void *arg)
+static int
+npunwa_link_step(struct npunwa_softc *sc)
 {
-	struct npunwa_softc *sc = arg;
 	struct npunwa_port *p;
 	uint32_t v;
 	int n;
 
 	mtx_assert(&sc->mtx, MA_OWNED);
-	if (!sc->running)
-		return;
 
 	n = sc->sweep;
 	if (n < NWA_FIRST_PORT || n > NWA_LAST_PORT)
@@ -301,7 +359,7 @@ npunwa_link_tick(void *arg)
 	}
 
 	sc->sweep = (n >= NWA_LAST_PORT) ? NWA_FIRST_PORT : n + 1;
-	callout_reset(&sc->ready, NPUNWA_LINK_TICK, npunwa_link_tick, sc);
+	return (NPUNWA_LINK_TICK);
 }
 
 /*
@@ -310,15 +368,12 @@ npunwa_link_tick(void *arg)
  * Everything here reads a value the coprocessor published, so it all belongs on this side of the
  * wait rather than at attach: the cookie, the version gate, and the maximum request length.
  */
-static void
-npunwa_ready_tick(void *arg)
+static int
+npunwa_ready_step(struct npunwa_softc *sc)
 {
-	struct npunwa_softc *sc = arg;
 	uint32_t cookie, body, maxreq;
 
 	mtx_assert(&sc->mtx, MA_OWNED);
-	if (!sc->running)
-		return;
 
 	cookie = nwa_rd(sc, NWA_COOKIE);
 	if (cookie != NWA_COOKIE_VALUE) {
@@ -327,14 +382,12 @@ npunwa_ready_tick(void *arg)
 			    "nwa: the network agent never appeared - cookie still 0x%08x after "
 			    "%d seconds. The front ports stay down.\n",
 			    cookie, NPUNWA_READY_TRIES / 2);
-			sc->running = 0;
-			return;
+			return (0);
 		}
 		if (sc->tries == 1)
 			device_printf(sc->fac.dev,
 			    "nwa: waiting for the network agent to publish its window\n");
-		callout_reset(&sc->ready, NPUNWA_READY_RETRY, npunwa_ready_tick, sc);
-		return;
+		return (NPUNWA_READY_RETRY);
 	}
 
 	/*
@@ -347,8 +400,7 @@ npunwa_ready_tick(void *arg)
 		device_printf(sc->fac.dev,
 		    "nwa: mailbox body offset 0x%x, this driver speaks 0x%x - refusing\n",
 		    body, NWA_BODY_EXPECTED);
-		sc->running = 0;
-		return;
+		return (0);
 	}
 	sc->body = body;
 
@@ -357,8 +409,7 @@ npunwa_ready_tick(void *arg)
 		device_printf(sc->fac.dev,
 		    "nwa: maximum request %u does not fit a %ju byte window - refusing\n",
 		    maxreq, (uintmax_t)sc->fac.size);
-		sc->running = 0;
-		return;
+		return (0);
 	}
 	sc->max_req = maxreq;
 
@@ -368,9 +419,39 @@ npunwa_ready_tick(void *arg)
 
 	npunwa_bring_up(sc);
 
-	/* The same callout now becomes the link poll. */
+	/* From here the same task is the link poll. */
+	sc->ready = 1;
 	sc->sweep = NWA_FIRST_PORT;
-	callout_reset(&sc->ready, NPUNWA_LINK_TICK, npunwa_link_tick, sc);
+	return (NPUNWA_LINK_TICK);
+}
+
+/*
+ * The one place either step runs from, and the only thread that touches the mailbox.
+ */
+static void
+npunwa_task(void *arg, int pending)
+{
+	struct npunwa_softc *sc = arg;
+	int delay, stop;
+
+	mtx_lock(&sc->mtx);
+	if (sc->stop || !sc->running) {
+		mtx_unlock(&sc->mtx);
+		return;
+	}
+	delay = sc->ready ? npunwa_link_step(sc) : npunwa_ready_step(sc);
+	if (delay <= 0)
+		sc->stop = 1;			/* nothing reschedules; say so once, here */
+	stop = sc->stop;
+	mtx_unlock(&sc->mtx);
+
+	/*
+	 * Read under the lock, acted on outside it. Requeueing while holding the mutex would be
+	 * harmless; requeueing after detach has decided to stop would not, so the decision has to
+	 * be the one detach published, not one re-read afterwards.
+	 */
+	if (!stop && delay > 0)
+		taskqueue_enqueue_timeout(sc->tq, &sc->task, delay);
 }
 
 int
@@ -388,14 +469,16 @@ npunwa_attach(struct npuep_facility *fac)
 	sc = malloc(sizeof(*sc), M_DEVBUF, M_WAITOK | M_ZERO);
 	sc->fac = *fac;
 	mtx_init(&sc->mtx, "npunwa", NULL, MTX_DEF);
-	callout_init_mtx(&sc->ready, &sc->mtx, 0);
+	sc->tq = taskqueue_create("npunwa", M_WAITOK, taskqueue_thread_enqueue, &sc->tq);
+	TIMEOUT_TASK_INIT(sc->tq, &sc->task, 0, npunwa_task, sc);
+	taskqueue_start_threads(&sc->tq, 1, PI_NET, "npunwa");
 
 	npunwa_sc = sc;
 
 	mtx_lock(&sc->mtx);
 	sc->running = 1;
-	callout_reset(&sc->ready, NPUNWA_READY_RETRY, npunwa_ready_tick, sc);
 	mtx_unlock(&sc->mtx);
+	taskqueue_enqueue_timeout(sc->tq, &sc->task, NPUNWA_READY_RETRY);
 
 	/*
 	 * Nothing here can fail any more. Everything that could - the cookie, the version, the
@@ -419,16 +502,31 @@ npunwa_detach(void)
 	 * interfaces live with nothing behind them, which is worse than dark.
 	 */
 	mtx_lock(&sc->mtx);
-	sc->running = 0;
+	sc->stop = 1;
+	wakeup(&sc->busy);		/* whatever is mid-wait gives up now */
 	mtx_unlock(&sc->mtx);
-	callout_drain(&sc->ready);
 
+	/*
+	 * Stop the task before touching the window ourselves, and keep cancelling until there is
+	 * nothing left to cancel. One drain is not enough on its own: an instance that started
+	 * before the flag was published can requeue after the drain returns, and then
+	 * taskqueue_free waits for a thread that keeps being handed work. That is a hung unload,
+	 * and it is uninterruptible.
+	 */
+	while (taskqueue_cancel_timeout(sc->tq, &sc->task, NULL) != 0)
+		taskqueue_drain_timeout(sc->tq, &sc->task);
+	taskqueue_drain_timeout(sc->tq, &sc->task);
+	taskqueue_free(sc->tq);
+	sc->tq = NULL;
+
+	/* Nothing else can reach the mailbox now, and this context is allowed to sleep. */
 	mtx_lock(&sc->mtx);
 	if (sc->body != 0 && nwa_rd(sc, NWA_COOKIE) == NWA_COOKIE_VALUE) {
 		for (n = NWA_FIRST_PORT; n <= NWA_LAST_PORT; n++)
 			if (sc->port[n].up)
 				(void)npunwa_port_set_state(sc, n, 0);
 	}
+	sc->running = 0;
 	mtx_unlock(&sc->mtx);
 
 	device_printf(sc->fac.dev, "nwa: %ju commands, %ju refused, %ju timed out\n",
