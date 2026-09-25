@@ -56,6 +56,19 @@
 #define	NPUNWA_IDLE_WAIT	100	/* x 10 ms - waiting for the previous transaction */
 #define	NPUNWA_REPLY_WAIT	3000	/* x 10 ms - waiting for the answer */
 
+/*
+ * NetAgent does not exist yet when this driver attaches, and that is not a fault in either of
+ * them. The coprocessor's startup blocks on the host handshake, which npuep completes during its
+ * own attach; NetAgent starts about fifteen seconds after that and only then publishes the
+ * cookie. So a driver that reads the window at attach time finds zeros.
+ *
+ * The vendor's module handles this by re-queueing its own work and logging "waiting for facility
+ * config availability", and that is the right shape: retry, do not block the load. Sixty seconds
+ * is four times what the coprocessor has ever taken.
+ */
+#define	NPUNWA_READY_RETRY	(hz / 2)
+#define	NPUNWA_READY_TRIES	120
+
 struct npunwa_port {
 	uint32_t	id;
 	int		link;		/* last carrier we read, -1 if never read */
@@ -66,6 +79,9 @@ struct npunwa_port {
 struct npunwa_softc {
 	struct npuep_facility	 fac;
 	struct mtx		 mtx;
+	struct callout		 ready;
+	int			 tries;
+	int			 running;
 	uint32_t		 body;		/* NWA_BODY_OFF's value, also the gate */
 	uint32_t		 max_req;
 	struct npunwa_port	 port[NWA_LAST_PORT + 1];
@@ -244,11 +260,76 @@ npunwa_bring_up(struct npunwa_softc *sc)
 	}
 }
 
+/*
+ * Poll for the far side, then do the whole of the once-only setup and stop.
+ *
+ * Everything here reads a value the coprocessor published, so it all belongs on this side of the
+ * wait rather than at attach: the cookie, the version gate, and the maximum request length.
+ */
+static void
+npunwa_ready_tick(void *arg)
+{
+	struct npunwa_softc *sc = arg;
+	uint32_t cookie, body, maxreq;
+
+	mtx_assert(&sc->mtx, MA_OWNED);
+	if (!sc->running)
+		return;
+
+	cookie = nwa_rd(sc, NWA_COOKIE);
+	if (cookie != NWA_COOKIE_VALUE) {
+		if (++sc->tries >= NPUNWA_READY_TRIES) {
+			device_printf(sc->fac.dev,
+			    "nwa: the network agent never appeared - cookie still 0x%08x after "
+			    "%d seconds. The front ports stay down.\n",
+			    cookie, NPUNWA_READY_TRIES / 2);
+			sc->running = 0;
+			return;
+		}
+		if (sc->tries == 1)
+			device_printf(sc->fac.dev,
+			    "nwa: waiting for the network agent to publish its window\n");
+		callout_reset(&sc->ready, NPUNWA_READY_RETRY, npunwa_ready_tick, sc);
+		return;
+	}
+
+	/*
+	 * The version gate. This field is also the body offset, so a value other than the one we
+	 * understand is both "a different protocol" and "the body is somewhere else" - there is
+	 * nothing sensible to do with it but refuse.
+	 */
+	body = nwa_rd(sc, NWA_BODY_OFF);
+	if (body != NWA_BODY_EXPECTED) {
+		device_printf(sc->fac.dev,
+		    "nwa: mailbox body offset 0x%x, this driver speaks 0x%x - refusing\n",
+		    body, NWA_BODY_EXPECTED);
+		sc->running = 0;
+		return;
+	}
+	sc->body = body;
+
+	maxreq = nwa_rd(sc, NWA_MAX_REQ);
+	if (maxreq < NWA_REQ_SIZE || maxreq > sc->fac.size) {
+		device_printf(sc->fac.dev,
+		    "nwa: maximum request %u does not fit a %ju byte window - refusing\n",
+		    maxreq, (uintmax_t)sc->fac.size);
+		sc->running = 0;
+		return;
+	}
+	sc->max_req = maxreq;
+
+	device_printf(sc->fac.dev,
+	    "nwa: mailbox ready after %d ms, body at +0x%x, requests up to %u bytes\n",
+	    sc->tries * (1000 / 2), sc->body, sc->max_req);
+
+	npunwa_bring_up(sc);
+	/* Once only. Nothing reschedules from here. */
+}
+
 int
 npunwa_attach(struct npuep_facility *fac)
 {
 	struct npunwa_softc *sc;
-	uint32_t cookie, body, maxreq;
 	int err;
 
 	if (npunwa_sc != NULL)
@@ -261,53 +342,19 @@ npunwa_attach(struct npuep_facility *fac)
 	sc = malloc(sizeof(*sc), M_DEVBUF, M_WAITOK | M_ZERO);
 	sc->fac = *fac;
 	mtx_init(&sc->mtx, "npunwa", NULL, MTX_DEF);
-
-	cookie = nwa_rd(sc, NWA_COOKIE);
-	if (cookie != NWA_COOKIE_VALUE) {
-		device_printf(fac->dev,
-		    "nwa: cookie 0x%08x, expected 0x%08x - the far side is not ready\n",
-		    cookie, NWA_COOKIE_VALUE);
-		err = ENXIO;
-		goto fail;
-	}
-
-	/*
-	 * The version gate. This field is also the body offset, so a value other than the one we
-	 * understand is both "a different protocol" and "the body is somewhere else" - there is
-	 * nothing sensible to do with it but refuse.
-	 */
-	body = nwa_rd(sc, NWA_BODY_OFF);
-	if (body != NWA_BODY_EXPECTED) {
-		device_printf(fac->dev,
-		    "nwa: mailbox body offset 0x%x, this driver speaks 0x%x - refusing\n",
-		    body, NWA_BODY_EXPECTED);
-		err = ENOTSUP;
-		goto fail;
-	}
-	sc->body = body;
-
-	maxreq = nwa_rd(sc, NWA_MAX_REQ);
-	if (maxreq < NWA_REQ_SIZE || maxreq > fac->size) {
-		device_printf(fac->dev,
-		    "nwa: maximum request %u does not fit a %ju byte window - refusing\n",
-		    maxreq, (uintmax_t)fac->size);
-		err = ERANGE;
-		goto fail;
-	}
-	sc->max_req = maxreq;
-
-	device_printf(fac->dev, "nwa: mailbox ready, body at +0x%x, requests up to %u bytes\n",
-	    sc->body, sc->max_req);
+	callout_init_mtx(&sc->ready, &sc->mtx, 0);
 
 	npunwa_sc = sc;
 
 	mtx_lock(&sc->mtx);
-	npunwa_bring_up(sc);
+	sc->running = 1;
+	callout_reset(&sc->ready, NPUNWA_READY_RETRY, npunwa_ready_tick, sc);
 	mtx_unlock(&sc->mtx);
 
 	return (0);
 
 fail:
+	callout_drain(&sc->ready);
 	mtx_destroy(&sc->mtx);
 	free(sc, M_DEVBUF);
 	return (err);
@@ -327,7 +374,12 @@ npunwa_detach(void)
 	 * interfaces live with nothing behind them, which is worse than dark.
 	 */
 	mtx_lock(&sc->mtx);
-	if (nwa_rd(sc, NWA_COOKIE) == NWA_COOKIE_VALUE) {
+	sc->running = 0;
+	mtx_unlock(&sc->mtx);
+	callout_drain(&sc->ready);
+
+	mtx_lock(&sc->mtx);
+	if (sc->body != 0 && nwa_rd(sc, NWA_COOKIE) == NWA_COOKIE_VALUE) {
 		for (n = NWA_FIRST_PORT; n <= NWA_LAST_PORT; n++)
 			if (sc->port[n].up)
 				(void)npunwa_port_set_state(sc, n, 0);
