@@ -738,15 +738,20 @@ npumgmt_tick(void *arg)
 		if (link == PCINET_LINK_ESTABLISHED && sc->published) {
 			if_link_state_change(ifp, LINK_STATE_UP);
 		} else {
-			/*
-			 * Anything that is not an established link we published ourselves puts
-			 * the interface back to not-running, so that bringing it up again
-			 * republishes instead of silently doing nothing. Before, the flag was
-			 * only ever set and the link could never be re-established.
-			 */
-			sc->published = 0;
-			if_setdrvflagbits(ifp, 0, IFF_DRV_RUNNING);
 			if_link_state_change(ifp, LINK_STATE_DOWN);
+
+			/*
+			 * Only a far side that says the link is down takes the publication
+			 * back. NETIF_OPEN and HOST_UP are this host's OWN states on the way
+			 * to established - clearing on those undoes the publish that set them
+			 * one tick earlier, and the link then never comes up at all. That is
+			 * not hypothetical: it is what the first version of this check did,
+			 * and it cost a build-and-load cycle to see.
+			 */
+			if (link == PCINET_LINK_IS_DOWN || link == PCINET_NETIF_STOP) {
+				sc->published = 0;
+				if_setdrvflagbits(ifp, 0, IFF_DRV_RUNNING);
+			}
 		}
 	}
 
