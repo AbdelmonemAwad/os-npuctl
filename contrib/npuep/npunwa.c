@@ -69,6 +69,13 @@
 #define	NPUNWA_READY_RETRY	(hz / 2)
 #define	NPUNWA_READY_TRIES	120
 
+/*
+ * Link state, once the ports are up. One port per tick rather than all ten at once: each read is
+ * a full mailbox transaction against a far side that is also serving its own poll loop, and
+ * sweeping the panel once a second is far more resolution than a cable being plugged in needs.
+ */
+#define	NPUNWA_LINK_TICK	(hz / 10)
+
 struct npunwa_port {
 	uint32_t	id;
 	int		link;		/* last carrier we read, -1 if never read */
@@ -82,6 +89,7 @@ struct npunwa_softc {
 	struct callout		 ready;
 	int			 tries;
 	int			 running;
+	int			 sweep;		/* which port the link poll looks at next */
 	uint32_t		 body;		/* NWA_BODY_OFF's value, also the gate */
 	uint32_t		 max_req;
 	struct npunwa_port	 port[NWA_LAST_PORT + 1];
@@ -230,7 +238,8 @@ npunwa_bring_up(struct npunwa_softc *sc)
 		struct npunwa_port *p = &sc->port[n];
 
 		p->id = NWA_PORT_ID(n);
-		p->link = p->media = -1;
+		p->link = -1;		/* unknown, so the first sweep always reports */
+		p->media = -1;
 
 		if (npunwa_port_set_state(sc, n, 1) != 0) {
 			device_printf(sc->fac.dev, "nwa: port %d refused to come up\n", n);
@@ -248,16 +257,51 @@ npunwa_bring_up(struct npunwa_softc *sc)
 			p->media = (int)v;
 	}
 
-	device_printf(sc->fac.dev, "nwa: %d of %d ports up, %d with carrier\n",
-	    up, NWA_LAST_PORT - NWA_FIRST_PORT + 1, linked);
+	/*
+	 * Do not report carrier here. A port that has just been commanded up has not finished
+	 * autonegotiating, so this reads zero on a cable that is plugged in and working - which is
+	 * exactly what the first version did, and it looked like a fault. The link poll below says
+	 * what is actually connected, a moment later.
+	 */
+	device_printf(sc->fac.dev, "nwa: %d of %d ports up\n",
+	    up, NWA_LAST_PORT - NWA_FIRST_PORT + 1);
+	(void)linked;
+}
 
-	for (n = NWA_FIRST_PORT; n <= NWA_LAST_PORT; n++) {
-		struct npunwa_port *p = &sc->port[n];
+/*
+ * One port per tick. Reports a change and nothing else, so the log says when a cable moved rather
+ * than repeating itself once a second forever.
+ */
+static void
+npunwa_link_tick(void *arg)
+{
+	struct npunwa_softc *sc = arg;
+	struct npunwa_port *p;
+	uint32_t v;
+	int n;
 
-		if (p->link > 0)
-			device_printf(sc->fac.dev, "nwa:   port %d (0x%04x, %s) has carrier\n",
-			    n, p->id, p->media == 3 ? "fibre" : "copper");
+	mtx_assert(&sc->mtx, MA_OWNED);
+	if (!sc->running)
+		return;
+
+	n = sc->sweep;
+	if (n < NWA_FIRST_PORT || n > NWA_LAST_PORT)
+		n = NWA_FIRST_PORT;
+	p = &sc->port[n];
+
+	if (p->up && npunwa_port_get(sc, n, NWA_SUB_STATE, &v) == 0) {
+		int link = (v != 0);
+
+		if (link != p->link) {
+			device_printf(sc->fac.dev, "nwa: port %d (0x%04x, %s) %s\n",
+			    n, p->id, p->media == 3 ? "fibre" : "copper",
+			    link ? "carrier up" : "carrier down");
+			p->link = link;
+		}
 	}
+
+	sc->sweep = (n >= NWA_LAST_PORT) ? NWA_FIRST_PORT : n + 1;
+	callout_reset(&sc->ready, NPUNWA_LINK_TICK, npunwa_link_tick, sc);
 }
 
 /*
@@ -323,7 +367,10 @@ npunwa_ready_tick(void *arg)
 	    sc->tries * (1000 / 2), sc->body, sc->max_req);
 
 	npunwa_bring_up(sc);
-	/* Once only. Nothing reschedules from here. */
+
+	/* The same callout now becomes the link poll. */
+	sc->sweep = NWA_FIRST_PORT;
+	callout_reset(&sc->ready, NPUNWA_LINK_TICK, npunwa_link_tick, sc);
 }
 
 int
