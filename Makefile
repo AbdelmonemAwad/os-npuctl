@@ -17,5 +17,10 @@ PLUGIN_MAINTAINER=	eg2@live.com
 # What the package does install is the reset hook, which is the half that is safe unattended:
 # it touches a USB bridge, exits 0 on hardware it does not recognise, and cannot affect the
 # host if it fails.
+#
+# What it DOES do, as of the boot hook pair, is install a module that has already been built on the
+# appliance into /boot/modules and load it at boot. Building stays manual; remembering to load it
+# does not, because a firewall that comes up without its front ports because somebody forgot a
+# kldload is a firewall that is down.
 
 .include "../../Mk/plugins.mk"

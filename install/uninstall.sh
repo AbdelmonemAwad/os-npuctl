@@ -21,10 +21,15 @@ if kldstat -q -n npuep; then
 fi
 
 rm -f "${PREFIX}/etc/rc.syshook.d/early/01-npuctl"
+rm -f "${PREFIX}/etc/rc.syshook.d/early/02-npuep"
+
+# And the module, so the next boot cannot load a driver whose plugin is gone. The source is
+# untouched - it lives in the repository, not here.
+rm -f /boot/modules/npuep.ko
 rm -f "${PREFIX}/opnsense/scripts/npuctl/mcp2210.py"
 rm -f "${PREFIX}/opnsense/scripts/npuctl/npuhs.py"
 rmdir "${PREFIX}/opnsense/scripts/npuctl" 2>/dev/null || true
 
 # hidraw_load is left in loader.conf.local on purpose: it is harmless, it may have been there
 # before this plugin, and removing a line somebody else added is worse than leaving one behind.
-echo "removed. hidraw_load was left in /boot/loader.conf.local."
+echo "removed, including /boot/modules/npuep.ko. hidraw_load was left in /boot/loader.conf.local."

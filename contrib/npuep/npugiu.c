@@ -1661,54 +1661,62 @@ npugiu_sysctl_rings(SYSCTL_HANDLER_ARGS)
 }
 
 /*
- * The device's own packet counters, asked for on demand.
+ * What this driver has counted, and why it is not the device's own count.
  *
- * This is the question the host cannot answer by itself: whether the coprocessor has frames for
- * us at all. If rx_packets climbs while our pools stay untouched, it has them and is refusing to
- * hand them over, and rx_bm_dropped says whether it is for want of a buffer. If rx_packets stays
- * at zero, nothing is reaching it and the fault is further out than this driver.
+ * Three commands were tried for the device's figures and none of them works on this hardware.
+ * GET_STATISTICS is answered, at full length, with nothing but zeros - Marvell's header labels
+ * that member CC_PF_PP2_STATISTICS, the physical packet processor's counters, and a function with
+ * no physical port has none to report. GET_GP_STATS and GET_GP_QUEUE_STATS, which are the GIU
+ * port's own, are not implemented in this firmware at all: both time out with no reply.
+ *
+ * So this reports what the driver itself counted, which is true and which matches netstat, and
+ * says plainly that the device's own numbers are unavailable rather than printing a zero that
+ * reads like a measurement. An instrument that lies is worse than one that admits it cannot see:
+ * this sysctl printed "rx 0 packets" for as long as it existed, while hundreds of frames arrived
+ * on these interfaces in the same second, and that cost an evening.
+ *
+ * The device commands are left defined in npugiu.h with the same explanation. Knowing which
+ * question the hardware refuses is worth keeping; asking it on every read is not, because each
+ * attempt costs a five-second timeout.
  */
 static int
 npugiu_sysctl_stats(SYSCTL_HANDLER_ARGS)
 {
 	struct npugiu_softc *sc = arg1;
-	uint8_t p[AGNIC_MGMT_DESC_DATA_LEN];
-	uint8_t a[AGNIC_R_ST_SIZE];
 	char buf[512];
-	int err, len;
 
-	GIU_LOCK(sc);
-	memset(p, 0, sizeof(p));
-	p[AGNIC_P_STATS_RESET] = 0;		/* read, do not clear */
-	err = npugiu_command(sc, AGNIC_CC_PF_GET_STATISTICS, p, AGNIC_P_STATS_LEN);
-	len = sc->answer_len;
-	if (err == 0 && len >= (int)sizeof(a))
-		memcpy(a, sc->answer, sizeof(a));
-	GIU_UNLOCK(sc);
+	snprintf(buf, sizeof(buf),
+	    "rx %ju packets %ju bytes (dropped %ju, malformed %ju, no mbuf %ju, unknown port %ju)\n"
+	    "tx %ju packets %ju bytes (ring full %ju, oversize %ju)\n"
+	    "the device's own counters are unavailable: GET_GP_STATS is not implemented by this "
+	    "firmware and GET_STATISTICS returns the physical processor's block, which this "
+	    "function answers with zeros",
+	    (uintmax_t)sc->rx_packets, (uintmax_t)sc->rx_bytes, (uintmax_t)sc->rx_dropped,
+	    (uintmax_t)sc->rx_bad, (uintmax_t)sc->rx_nobuf, (uintmax_t)sc->rx_untagged,
+	    (uintmax_t)sc->tx_packets, (uintmax_t)sc->tx_bytes, (uintmax_t)sc->tx_full,
+	    (uintmax_t)sc->tx_toolong);
 
-	if (err != 0)
-		snprintf(buf, sizeof(buf), "the device refused to report statistics (%d)", err);
-	else if (len < (int)sizeof(a))
-		snprintf(buf, sizeof(buf),
-		    "the device answered with %d bytes, too short to be statistics", len);
-	else
-		snprintf(buf, sizeof(buf),
-		    "rx %ju packets %ju bytes %ju unicast %ju errors | "
-		    "dropped: fullq %ju bm %ju early %ju fifo %ju cls %ju | "
-		    "tx %ju packets %ju bytes %ju unicast %ju errors",
-		    (uintmax_t)le64dec(a + AGNIC_R_ST_RX_PACKETS),
-		    (uintmax_t)le64dec(a + AGNIC_R_ST_RX_BYTES),
-		    (uintmax_t)le64dec(a + AGNIC_R_ST_RX_UNICAST),
-		    (uintmax_t)le64dec(a + AGNIC_R_ST_RX_ERRORS),
-		    (uintmax_t)le64dec(a + AGNIC_R_ST_RX_FULLQ_DROP),
-		    (uintmax_t)le64dec(a + AGNIC_R_ST_RX_BM_DROP),
-		    (uintmax_t)le64dec(a + AGNIC_R_ST_RX_EARLY_DROP),
-		    (uintmax_t)le64dec(a + AGNIC_R_ST_RX_FIFO_DROP),
-		    (uintmax_t)le64dec(a + AGNIC_R_ST_RX_CLS_DROP),
-		    (uintmax_t)le64dec(a + AGNIC_R_ST_TX_PACKETS),
-		    (uintmax_t)le64dec(a + AGNIC_R_ST_TX_BYTES),
-		    (uintmax_t)le64dec(a + AGNIC_R_ST_TX_UNICAST),
-		    (uintmax_t)le64dec(a + AGNIC_R_ST_TX_ERRORS));
+	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
+}
+
+/*
+ * The same, per receive queue.
+ *
+ * Four were registered because that is what the device's configuration expects to exist. This is
+ * how to tell whether they are all being used or whether everything lands on one - which matters,
+ * because a single queue carrying everything is a bottleneck that no other counter would show.
+ * The device's per-queue command is not implemented either, so again these are the driver's.
+ */
+static int
+npugiu_sysctl_queue_stats(SYSCTL_HANDLER_ARGS)
+{
+	struct npugiu_softc *sc = arg1;
+	char buf[256];
+	int q, n = 0;
+
+	for (q = 0; q < NPUGIU_NUM_QS && n < (int)sizeof(buf) - 32; q++)
+		n += snprintf(buf + n, sizeof(buf) - n, "%srx q%d %ju",
+		    q == 0 ? "" : "  ", q, (uintmax_t)sc->rx_q[q]);
 
 	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
 }
@@ -1796,6 +1804,9 @@ npugiu_add_sysctls(struct npugiu_softc *sc)
 	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "stats",
 	    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0, npugiu_sysctl_stats, "A",
 	    "the device's own packet counters, asked for when this is read");
+	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "queue_stats",
+	    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0, npugiu_sysctl_queue_stats, "A",
+	    "the device's per-queue packet counts, each direction");
 	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "loopback",
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0, npugiu_sysctl_loopback, "I",
 	    "send transmitted frames straight back up the receive path");
