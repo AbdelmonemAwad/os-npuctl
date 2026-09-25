@@ -123,8 +123,14 @@ put a doubleword on the bus, and it lands on the host's field as well.
 
 The consequence is not a lost count. A host that reads its own index back out of that word and
 then uses it to subscript the entry array or the buffer table turns the peer's store into a wild
-pointer, and faults inside the packet copy with a backtrace that points nowhere near the cause.
-That was a real page-fault panic on this appliance, seconds after the first frames moved.
+pointer, and would fault inside the packet copy with a backtrace pointing nowhere near the cause.
+
+That is reasoning from the layout, not an observation. This hazard has **not** been seen to fire
+on this hardware. It was written up here after a page-fault panic that it was wrongly blamed for -
+the dump showed a different cause entirely, recorded in
+[porting-notes.md](porting-notes.md#if_init-is-not-optional). The hazard is real and the code
+guards against it, but nothing here should be read as evidence that the coprocessor does merge
+those stores.
 
 So the host keeps its own index in its own softc, writes it out to the shared word and never
 reads it back; and it range-checks the peer's index against the ring size on every use, treating

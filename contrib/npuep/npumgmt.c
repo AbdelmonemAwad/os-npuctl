@@ -879,6 +879,48 @@ npumgmt_withdraw(struct npumgmt_softc *sc)
 	return (ETIMEDOUT);
 }
 
+/*
+ * if_init, and the reason it is not optional.
+ *
+ * The stack calls this through a bare function pointer and does not check it first. When an
+ * address is added to an interface that is up but not yet RUNNING, in6_update_ifa() goes
+ * straight through ifp->if_init - so an ifnet that never had one set is a call to address zero.
+ * That is a page fault in the context of whatever process ran ifconfig, with an instruction
+ * pointer of 0 and a backtrace that names the network stack and never mentions this driver.
+ *
+ * It is exactly how this driver took the appliance down the first time mvmgmt0 was given an
+ * IPv6 address:
+ *
+ *	--- trap 0xc, rip = 0 ---
+ *	??() at 0
+ *	in6_update_ifa() ... in6_ifattach() ... in6_if_up() ... nd6_ioctl() ... ifioctl()
+ *
+ * if_alloc() zeroes the ifnet, so leaving if_init unset is not a missing optimisation. It is a
+ * null pointer handed to the kernel with an invitation to jump to it.
+ */
+static void
+npumgmt_init_locked(struct npumgmt_softc *sc)
+{
+	mtx_assert(&sc->mtx, MA_OWNED);
+
+	if (!sc->running)
+		return;
+	if ((if_getdrvflags(sc->ifp) & IFF_DRV_RUNNING) != 0)
+		return;
+
+	npumgmt_publish(sc);
+}
+
+static void
+npumgmt_init(void *xsc)
+{
+	struct npumgmt_softc *sc = xsc;
+
+	MGMT_LOCK(sc);
+	npumgmt_init_locked(sc);
+	MGMT_UNLOCK(sc);
+}
+
 static int
 npumgmt_ioctl(if_t ifp, u_long cmd, caddr_t data)
 {
@@ -889,10 +931,8 @@ npumgmt_ioctl(if_t ifp, u_long cmd, caddr_t data)
 	switch (cmd) {
 	case SIOCSIFFLAGS:
 		MGMT_LOCK(sc);
-		if ((if_getflags(ifp) & IFF_UP) != 0) {
-			if ((if_getdrvflags(ifp) & IFF_DRV_RUNNING) == 0)
-				npumgmt_publish(sc);
-		}
+		if ((if_getflags(ifp) & IFF_UP) != 0)
+			npumgmt_init_locked(sc);
 		MGMT_UNLOCK(sc);
 		break;
 	case SIOCSIFMTU:
@@ -966,6 +1006,7 @@ npumgmt_attach(struct npuep_facility *fac)
 	if_setsoftc(sc->ifp, sc);
 	if_initname(sc->ifp, "mvmgmt", 0);
 	if_setflags(sc->ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST);
+	if_setinitfn(sc->ifp, npumgmt_init);
 	if_setstartfn(sc->ifp, npumgmt_start);
 	if_setioctlfn(sc->ifp, npumgmt_ioctl);
 	if_setsendqlen(sc->ifp, PCINET_TX_Q_SIZE - 1);
