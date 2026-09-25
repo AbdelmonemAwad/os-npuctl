@@ -340,6 +340,176 @@ and MTU can be read and set need the NetAgent message set, which has to be recov
 `mv_nwa_host` the way the MCP2210 command map was recovered from `xgs-usb-spi-flash`. The first is
 worth having on its own; the second is a separate piece of work.
 
+## The channel in numbers
+
+Both management rings are **256 entries of the 64-byte descriptor**, 16 KiB each, in host memory
+(`AGNIC_CMD_Q_LEN`, `giu_nic.h:107`; `AGNIC_NOTIF_Q_LEN` is defined as the same). Their four index
+words are the first four slots of the BAR0 index array - the command ring takes 0 and 1, the
+notification ring 2 and 3, and the data rings take what is left in allocation order.
+
+The command ring's cookie table is **1024 entries, deliberately not 256** (`giu_nic.c:1909`):
+`cmd_idx` is a free-running counter modulo 1024 that skips 0 and `0xFFFF`, so a tag is reused only
+after 1023 further commands. A response is matched **by that tag alone** - nothing else in the
+descriptor is checked against the command that produced it.
+
+**There is no interrupt on this channel at all.** The management IRQ hooks are empty stubs; a
+per-CPU timer, armed on one designated CPU, drains the notification ring, and the same loop
+handles responses, asynchronous notifications (`cmd_idx == 0xFFFF`) and custom in-band messages.
+Every bring-up command fits in the 56 inline bytes, so the multi-descriptor path is dead code in
+this tree - which is worth knowing, because it is also the path with the worst bugs.
+
+Two waits, both longer than their comments suggest: `DEV_READY` is polled for up to **10 to 20
+seconds** at probe, before a single other field of the config structure may be read; `DEV_MGMT_READY`
+for **1 to 2 seconds** after the rings are published, under a comment that says "~1 second".
+
+## Writing a port against this: what not to copy
+
+Four independent readings of `giu_nic.c`, `giu_nic_mgmt.c` and `giu_custom_mgmt.c` produced
+eighty-six of these. What follows is the part that changes how a FreeBSD driver has to be written,
+rather than the part that is merely untidy.
+
+### There is not one memory barrier in four and a half thousand lines
+
+No `wmb`, no `dma_wmb`, no `rmb`, no `smp_*`, no `barrier()` anywhere in `giu_nic.c`. The only two
+in the whole tree are in `giu_nic_mgmt.c`. Every ring hand-over is
+
+```c
+	/* ... write the whole descriptor ... */
+	writel(ring->tx_prod_shadow, ring->producer_p);
+```
+
+and the only thing ordering those descriptor stores before the doorbell is the `__iowmb()` that
+Linux hides inside `writel()`. **FreeBSD's `bus_space_write_4` makes no such promise.** Transcribed
+literally, the device fetches descriptors the host has not finished writing, and the failure looks
+like corrupted packets rather than like a missing barrier.
+
+A port needs an explicit release barrier between the descriptor writes and the index write, in
+every direction, on every ring - and an acquire barrier after reading a device-written index and
+before reading the descriptor it refers to. That second one the vendor does not have either.
+
+### MMIO is handled as ordinary memory, and on FreeBSD it cannot be
+
+`nic_cfg_base` is a `struct agnic_config_mem *` assigned from a `void __iomem *` with the
+annotation silently dropped (`giu_nic.c:4355`). So the driver does `nic_cfg->status & DEV_READY` in
+a spin loop with no `readl`, `memcpy(dev_addr, nic_cfg->mac_addr, 6)` **out of** MMIO,
+`cmd_q_info->q_addr = ...` **into** MMIO, and `nic_cfg_base->status |= HOST_MGMT_READY` as a
+non-atomic read-modify-write over PCIe.
+
+The index array is the same: `memset(ring_indices_arr, 0xFF, size)` over a BAR, and the driver is
+inconsistent about its own rule - `readl(ring->producer_p)` at `giu_nic_mgmt.c:427` and a bare
+`*ring->producer_p` at `:494`, for the same register. The bare one can be hoisted out of a loop and
+spin on a stale value.
+
+None of this translates. Every one of these is `bus_read_4` / `bus_write_4` /
+`bus_space_set_region_4` in a port, and there is no way to keep the plain-C style.
+
+### Everything the device says is trusted, and some of it is a subscript
+
+This is the same class of defect this project has now found four times, and it is here in three
+more places:
+
+- **`if (cmd_idx > cmd_ring->cookie_count)`** should be `>=`. `cookie_list` has exactly
+  `cookie_count` entries. A device that puts `cmd_idx == 1024` in a response descriptor indexes one
+  element past a `kmalloc`ed array and the driver then **writes through the pointer it finds there**.
+- **`agnic_tx_done_handle_ring` walks to the device-supplied consumer index with no clamp** against
+  the host's own producer. A device index that leads the producer frees cookies that were never
+  populated - and that is the actual mechanism behind vendor patches 0014, 0015 and 0031, which
+  chase the symptom rather than the cause. Clamp to your own producer and treat anything past it as
+  a device fault.
+- **`dev_use_size` is a device-supplied `u32` that decides where the index array lands in BAR0.**
+  The bounds check is against `AGNIC_CONFIG_BAR_SIZE` (64 KiB) while the GIU window is 16 KiB with
+  the MSI-X table at +4 KiB, so a device reporting `dev_use_size >= 4096` puts 1544 bytes of index
+  array on top of the MSI-X table and the check passes.
+
+And the cookies themselves are **raw kernel virtual pointers on the wire** - `desc->cookie =
+(u64)tx_buf`, `desc->buff_cookie = (u64)cookie`. Any corruption on the far side becomes an
+arbitrary kernel-pointer dereference here. Use a ring index or a bounded handle table.
+
+### The validity scheme is a heuristic, and the wire format has no ownership bit
+
+There is no DONE or OWN bit in the descriptor (`giu_nic_hw.h:286`). Whether the device has filled a
+receive descriptor is decided by **magic values** - `0xcafecafe` in `buffer_addr`, and the
+`0xdeaddead` cookie watermark that patch 0011 added afterwards. The code's own comment calls it a
+workaround for a "DMA reordering issue".
+
+A fresh implementation has to poison the ring the same way and check the same values. There is
+nothing else to check.
+
+### `msix_mode=3` does not work, whatever the module parameter says
+
+`agnic_request_msix_irqs` returns the `start_vector` it was passed rather than the next free
+vector, so with both directions enabled the transmit handlers are requested on the same doorbell
+indices as the receive handlers, `request_irq` without `IRQF_SHARED` fails `-EBUSY`, and open
+fails. The same confusion reaches the device: `mv_get_msi_id` is called with the same
+`q_vector->v_idx` for both the ingress and the egress queue-add commands, so the device is told one
+MSI-X id for two directions. A port needs a distinct vector index per direction.
+
+Also: when receive MSI-X is off, `poll_timer_rate` is **zero**, and the per-CPU timer re-arms for
+the current tick forever, on every CPU present. A FreeBSD `callout` with a zero delay does the same
+thing and is worse behaved.
+
+### Lifecycle: once per module load, and the device is never told anything
+
+`static bool first_time` inside `agnic_net_open` gates all ring, buffer-pool, interrupt and
+hardware-queue setup. It is **module-scope, not per-device**, so a second instance never allocates
+its rings, and an interface taken down and brought back up reuses the old BAR index slots and the
+old descriptor contents - which is a plausible route into exactly the stale-index failures the
+vendor's patches chase. On FreeBSD, where `if_init` is called repeatedly and by the stack itself,
+translating this literally guarantees the bug.
+
+Any failure in open sets `AGNIC_FATAL_ERROR`, which nothing clears except probe, so one failed
+`ifconfig up` bricks the interface until the module is reloaded.
+
+And teardown tells the device nothing at all. `agnic_destroy_hw_queues()` is a stub that prints
+"Not implemented"; `CC_PF_CLOSE` is defined and never sent anywhere in the tree;
+`HOST_MGMT_READY` is never cleared and the `q_addr` fields are never zeroed - and then
+`dma_free_coherent` hands back exactly the rings the device was told to use. `CC_PF_DISABLE` is
+sent with no response buffer, so the host does not even learn when the device stopped.
+
+This is the same mistake the sibling `pcinet` driver makes, which vendor patch 0005 fixes there and
+which `npumgmt.c` in this repository refuses to make. It must not be carried into the GIU driver.
+
+### A timed-out command leaves a pointer to a dead stack frame
+
+Every caller passes a `struct agnic_mgmt_cmd_resp` **on its own stack** as the response buffer. On
+the five-second timeout path the handler returns without clearing `mgmt_buff->buf`, so the cookie
+slot stays busy forever *and* a late response makes the timer softirq `memcpy` up to 56 bytes into
+a stack frame that no longer exists.
+
+Two related ones in the same file: `static u16 cmd_idx, desc_required, desc_free, desc_idx;` - only
+the first is meant to be static, and the other three are a race waiting for a second CPU; and
+`spin_lock_bh` protects the send path only, while the notification handler mutates the same cookie
+entries from a timer on another CPU.
+
+### Linux shapes with no FreeBSD equivalent
+
+NAPI, `netdev_alloc_frag`/`build_skb`, `skb_shared_info` in the buffer tail, GRO, `rtnl` (which the
+synchronous send path unconditionally drops and retakes, making `rtnl` a precondition of every
+command that wants a response), tasklets, and `del_timer` without `_sync`. The FreeBSD shapes -
+taskqueues or iflib, mbuf external storage with a free callback, `callout_reset_on`, `counter(9)`,
+`tcp_lro`, per-queue mutexes - are different enough that a literal port produces nonsense.
+
+## Bring-up, in the order the code actually requires it
+
+1. Get the facility window; **poll `DEV_READY`** before reading any other config field.
+2. Claim the index array at `dev_use_size`, after bounds-checking it yourself.
+3. Allocate the command ring, then the notification ring.
+4. Write both `agnic_q_hw_info` blocks, **barrier**, set `HOST_MGMT_READY`, poll `DEV_MGMT_READY`.
+5. Start whatever drains the notification ring - **before** sending any command that wants a
+   response, because nothing else completes one.
+6. `CC_GET_CAPABILITIES`, whose answer decides the queue counts.
+7. Then, and only then, register the interface.
+
+On the first interface-up: allocate transmit rings, receive rings, buffer-pool rings; set up
+interrupts (the queue-add commands report the vector id per queue, so the vectors must exist
+first); then `MGMT_ECHO`, `PF_INIT`, `INGRESS_TC_ADD` per class, `INGRESS_DATA_Q_ADD` per queue,
+`EGRESS_TC_ADD` per class, `EGRESS_DATA_Q_ADD` per queue, `INIT_DONE`; then fill the buffer pools;
+then `CC_PF_ENABLE`.
+
+The buffer pool is published to the device while it is still empty, and filled afterwards. Fill it
+before enabling, write the consumer index, and write the producer index **last** - the one-slot gap
+between them is what keeps full and empty distinguishable.
+
 ## Also still open
 
 - ~~Whether the four `giu` doorbells are live.~~ **They are.** `mv_giu_drv` takes a module
