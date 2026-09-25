@@ -247,16 +247,63 @@ imported   skb_push                  transmit prepends
 `pport_%.4x` as a name format, and `PPORT_NAME_TYPE_PLUS_PORT_ID` as a naming mode, put the width
 beyond doubt: sixteen bits.
 
-So the datapath both ways is:
+### The frame format, and it is sixty-six bytes of overhead, not two
+
+Reading `pport_dev_hard_start_xmit` and `pport_do_receive` out of the module settles both
+directions, and the answer is bigger than the tag:
 
 ```
-transmit   skb_push(skb, 2); *(__be16 *)skb->data = htons(port_id); dev_queue_xmit(real_dev)
-receive    port_id = ntohs(*(__be16 *)skb->data); skb_pull(skb, 2); eth_type_trans(...)
++0x00   u16   port_id, network order
++0x02   64 bytes of metadata
++0x42   the Ethernet frame
 ```
 
-The receive half is proven by the code above. The transmit half is inferred from `skb_push`,
-`dev_queue_xmit` and the symmetry the receive half forces - it has not been read out of the
-disassembly, and a first implementation should confirm it with a capture rather than trust it.
+Transmit, taking the branch for `pport_cust == NULL` - no custom operations registered, which is
+the case a port starts from:
+
+```asm
+2361:  mov    $0x40,%esi
+236f:  call   skb_push              ; 64 bytes of metadata, filled with a ramp:
+228e:  ...    mov %cl,(%rdx,%rax,1) ;   byte i = (i - 64) & 0xFF, so 0xC0 0xC1 .. 0xFF
+22a4:  mov    $0x2,%esi
+22ac:  call   skb_push              ; then two more in front of that
+22b1:  movzwl 0x800(%rbp),%eax      ; the port id, 16 bits, out of the pport's private area
+22c2:  rol    $0x8,%ax              ; byte-swapped, so network order
+22c6:  mov    %ax,(%rdx)            ; written at the front
+```
+
+Receive, same condition, at `0x17b`:
+
+```asm
+ a1:  movzwl (%rax),%esi            ; 16 bits at skb->data
+ a4:  rol    $0x8,%si               ; ntohs
+ af:  call   _pport_find_dev        ; (real_dev, port_id) -> the pport, or NULL
+ b4:  test   %rax,%rax; je -> false ; NULL is what makes giu_nic print its warning
+ ed:  addq   $0x2,0x110(%rbx)       ; skb->data += 2      - the tag
+17b:  mov    $0x40,%eax             ; no custom ops: strip the whole metadata area
+138:  add    %rax,0x110(%rbx)       ; skb->data += 64     - the metadata
+162:  call   eth_type_trans
+```
+
+Sixty-six bytes each way, and symmetric. The earlier version of this page said two, inferred from
+`skb_push` being imported; that was right about the tag and wrong about the frame, and the
+difference is the sort that produces a link which passes a ping and corrupts everything larger.
+
+With custom operations registered - which is what Sophos's NetAgent does on the shipped system -
+the callback returns how many of those 64 bytes it used, and pport pushes or pulls only the
+remainder. The 64-byte area is fixed; its contents are NetAgent's business.
+
+Two things not to misread. `movl $0xABBACAFE,0x50(%rbx)` in the transmit path writes into the
+`sk_buff` structure, not into the packet - the data pointer is at `0x110` - so it is a marker on
+the buffer and not a field on the wire. And the transmit descriptor's `MD_MODE` flag, bit 22, is
+almost certainly what tells the device this metadata area is present; that is a hypothesis with
+the name on its side, not something read out of the code.
+
+**The risk worth naming**: on the shipped system `pport_cust` is always registered, so the
+no-custom-operations path above may never execute in practice. An implementation that sends 64
+bytes of `0xC0 0xC1 ...` filler is relying on a branch the vendor may never exercise. If the far
+side rejects it, the metadata format has to come out of `mv_nwa_host` before the datapath can
+work at all.
 
 ### And VLAN 4095 is not it
 
