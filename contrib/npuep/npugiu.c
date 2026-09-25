@@ -99,6 +99,26 @@
  * two for the port identifier and sixty-four of metadata. See docs/giu.md.
  */
 #define	NPUGIU_DATA_Q_LEN	256
+
+/*
+ * Queues per traffic class, each way.
+ *
+ * Four, because four is what the working system uses. The appliance's own boot log under the
+ * vendor's software says so outright:
+ *
+ *	agnic: Multiqueue Enabled: Rx Queue count = 4, Tx Queue count = 4
+ *	agnic: Multiqueue DMA Disabled: DMA count = 1
+ *
+ * and the coprocessor's fastpath polls exactly that many - giu-0.0 and giu-0.2 on one worker,
+ * giu-0.1 and giu-0.3 on the other. This driver registered one queue and was never sent a
+ * frame: the device accepted every command, reported the link up, consumed transmit
+ * descriptors, and never took a single buffer from the pool.
+ *
+ * Each receive queue carries its own buffer pool. That is not a choice either - the vendor
+ * indexes bp_ring[tc * num_qs_per_tc + i] alongside rx_ring with the same subscript, one pool
+ * per queue.
+ */
+#define	NPUGIU_NUM_QS		4
 /*
  * What a receive buffer holds if the coprocessor does not say otherwise, and the bounds we will
  * accept when it does. Ten kilobytes covers the ten-kilobyte MTU its own fastpath runs with.
@@ -181,10 +201,10 @@ struct npugiu_softc {
 	struct npugiu_ring	 cmd;
 	struct npugiu_ring	 notif;
 
-	/* the datapath: one transmit ring, one receive ring, one buffer pool */
-	struct npugiu_ring	 tx;
-	struct npugiu_ring	 rx;
-	struct npugiu_ring	 bp;
+	/* the datapath: NPUGIU_NUM_QS of each, one buffer pool per receive queue */
+	struct npugiu_ring	 tx[NPUGIU_NUM_QS];
+	struct npugiu_ring	 rx[NPUGIU_NUM_QS];
+	struct npugiu_ring	 bp[NPUGIU_NUM_QS];
 
 	int			 buf_size;	/* what the device asked for, or the default */
 	uint32_t		 cap_flags;
@@ -201,6 +221,7 @@ struct npugiu_softc {
 	uint64_t		 rx_packets, rx_bytes, rx_dropped, rx_bad, rx_nobuf;
 	uint64_t		 tx_packets, tx_bytes, tx_full, tx_toolong;
 	uint64_t		 rx_port[NPUGIU_MAX_PORTS];
+	uint64_t		 rx_q[NPUGIU_NUM_QS];	/* which queue a frame arrived on */
 
 	uint16_t		 next_tag;
 	uint8_t			 mac[6];		/* what the coprocessor advertises */
@@ -209,6 +230,7 @@ struct npugiu_softc {
 
 	/* the one outstanding command */
 	int			 waiting;
+	int			 cmd_busy;	/* a command is in flight */
 	uint16_t		 wait_tag;
 	int			 answered;
 	/*
@@ -220,6 +242,7 @@ struct npugiu_softc {
 	int			 answer_len;
 
 	int			 link;		/* as the device last reported it */
+	int			 loopback;	/* as we last set it */
 	uint64_t		 link_changes;
 	uint64_t		 commands, answers, notifications, drops;
 	uint64_t		 keepalives, late, multipart, overruns;
@@ -604,7 +627,13 @@ npugiu_drain(struct npugiu_softc *sc)
 static int
 npugiu_encap(struct npugiu_softc *sc, struct mbuf *m)
 {
-	struct npugiu_ring *r = &sc->tx;
+	/*
+	 * Transmit on queue zero only. Four are registered because that is what the device's
+	 * configuration expects to exist, but nothing here needs more than one: the send path is
+	 * serialised on the driver lock anyway, and a second queue would buy nothing until there
+	 * is a reason to spread across them.
+	 */
+	struct npugiu_ring *r = &sc->tx[0];
 	uint32_t cons, push;
 	uint8_t *d, *b;
 	int len = m->m_pkthdr.len;
@@ -696,14 +725,25 @@ npugiu_start(if_t ifp)
 static void
 npugiu_bpool_return(struct npugiu_softc *sc, uint32_t bufidx)
 {
-	struct npugiu_ring *r = &sc->bp;
-	uint32_t cons, push;
+	struct npugiu_ring *r;
+	uint32_t cons, push, q;
 	uint8_t *d;
 
 	mtx_assert(&sc->mtx, MA_OWNED);
 
 	if (bufidx >= (uint32_t)sc->nbuf)
 		return;
+
+	/*
+	 * Every pool owns a contiguous run of the buffer array, so the buffer's own index says
+	 * which pool it came from. A buffer returned to the wrong pool would still work - the
+	 * device is told an address, not an owner - but it would slowly empty one pool into
+	 * another, and a queue whose pool has run dry is silent in a way that is hard to see.
+	 */
+	q = bufidx / (uint32_t)NPUGIU_DATA_Q_LEN;
+	if (q >= NPUGIU_NUM_QS)
+		return;
+	r = &sc->bp[q];
 	if (!idx_remote(sc, r->cons_slot, r->len, &cons))
 		return;
 	push = r->shadow;
@@ -726,9 +766,10 @@ npugiu_bpool_return(struct npugiu_softc *sc, uint32_t bufidx)
  * there is, which is why the ring is stamped with it before it is ever published.
  */
 static int
-npugiu_rx(struct npugiu_softc *sc, int budget, struct mbuf **head, struct mbuf **tail)
+npugiu_rx_queue(struct npugiu_softc *sc, int q, int budget, struct mbuf **head,
+    struct mbuf **tail)
 {
-	struct npugiu_ring *r = &sc->rx;
+	struct npugiu_ring *r = &sc->rx[q];
 	if_t ifp = sc->ifp;
 	uint32_t prod;
 	int done = 0;
@@ -805,6 +846,7 @@ npugiu_rx(struct npugiu_softc *sc, int budget, struct mbuf **head, struct mbuf *
 		n = NPUGIU_PORT_NUM(port);
 		if (n < NPUGIU_MAX_PORTS)
 			sc->rx_port[n]++;
+		sc->rx_q[q]++;
 		if (ifp != NULL)
 			if_inc_counter(ifp, IFCOUNTER_IPACKETS, 1);
 
@@ -817,6 +859,21 @@ next:
 		idx_publish(sc, r->cons_slot, r->shadow);
 		done++;
 	}
+	return (done);
+}
+
+/*
+ * Every queue, once each, with the budget shared between them. Round-robin rather than
+ * first-come: a single queue that is always busy must not be able to starve the other three.
+ */
+static int
+npugiu_rx(struct npugiu_softc *sc, int budget, struct mbuf **head, struct mbuf **tail)
+{
+	int q, done = 0;
+
+	for (q = 0; q < NPUGIU_NUM_QS; q++)
+		done += npugiu_rx_queue(sc, q, budget / NPUGIU_NUM_QS, head, tail);
+
 	return (done);
 }
 
@@ -962,28 +1019,52 @@ npugiu_command(struct npugiu_softc *sc, uint8_t code, const void *params, size_t
 {
 	int err, i;
 
+	mtx_assert(&sc->mtx, MA_OWNED);
+
+	/*
+	 * One command in flight, whoever asks. The channel carries a single outstanding tag, and
+	 * until now the only caller was the bring-up, which is serial by construction. The
+	 * diagnostics below are issued from sysctl handlers, which are not.
+	 */
+	while (sc->cmd_busy) {
+		if (!sc->running)
+			return (ENXIO);
+		msleep(&sc->cmd_busy, &sc->mtx, 0, "npugiuq", hz / 10);
+	}
+	sc->cmd_busy = 1;
+
 	err = npugiu_post(sc, code, params, plen, 1);
 	if (err != 0)
-		return (err);
+		goto out;
 
 	for (i = 0; i < NPUGIU_CMD_WAIT; i++) {
 		if (sc->answered) {
-			if (sc->answer_len < 1)
-				return (EBADMSG);
+			if (sc->answer_len < 1) {
+				err = EBADMSG;
+				goto out;
+			}
 			if (sc->answer[AGNIC_R_STATUS] != AGNIC_R_STATUS_OK) {
 				device_printf(sc->fac.dev,
 				    "giu: command 0x%02x refused, status %u\n",
 				    code, sc->answer[AGNIC_R_STATUS]);
-				return (EINVAL);
+				err = EINVAL;
+				goto out;
 			}
-			return (0);
+			err = 0;
+			goto out;
 		}
-		if (!sc->running)
-			return (ENXIO);
+		if (!sc->running) {
+			err = ENXIO;
+			goto out;
+		}
 		msleep(&sc->answered, &sc->mtx, 0, "npugiu", hz / 100);
 	}
 	sc->waiting = 0;
-	return (ETIMEDOUT);
+	err = ETIMEDOUT;
+out:
+	sc->cmd_busy = 0;
+	wakeup(&sc->cmd_busy);
+	return (err);
 }
 
 /*
@@ -1149,32 +1230,43 @@ npugiu_capabilities(struct npugiu_softc *sc)
 static void
 npugiu_fill_bpool(struct npugiu_softc *sc)
 {
-	struct npugiu_ring *r = &sc->bp;
-	int i, fill = r->len - 1;
+	int q, i, total = 0;
 
 	mtx_assert(&sc->mtx, MA_OWNED);
 
-	if (fill > sc->nbuf)
-		fill = sc->nbuf;
+	for (q = 0; q < NPUGIU_NUM_QS; q++) {
+		struct npugiu_ring *r = &sc->bp[q];
+		int base = q * NPUGIU_DATA_Q_LEN;
+		int fill = r->len - 1;
 
-	for (i = 0; i < fill; i++) {
-		uint8_t *d = desc_at(r, (uint32_t)i);
+		if (base + fill > sc->nbuf)
+			fill = sc->nbuf - base;
+		if (fill < 0)
+			fill = 0;
 
-		le64enc(d + AGNIC_BPD_BUFF_ADDR_PHYS, (uint64_t)sc->buf[i].paddr);
-		/*
-		 * The cookie is ours and comes back untouched. The vendor puts a kernel virtual
-		 * pointer here, so any corruption on the far side becomes an arbitrary
-		 * dereference. An index cannot do that.
-		 */
-		le64enc(d + AGNIC_BPD_BUFF_COOKIE, (uint64_t)i);
+		for (i = 0; i < fill; i++) {
+			uint8_t *d = desc_at(r, (uint32_t)i);
+
+			le64enc(d + AGNIC_BPD_BUFF_ADDR_PHYS,
+			    (uint64_t)sc->buf[base + i].paddr);
+			/*
+			 * The cookie is ours and comes back untouched. The vendor puts a kernel
+			 * virtual pointer here, so any corruption on the far side becomes an
+			 * arbitrary dereference. An index cannot do that - and an index into the
+			 * whole array, not into this pool, is what says which pool to return it
+			 * to later.
+			 */
+			le64enc(d + AGNIC_BPD_BUFF_COOKIE, (uint64_t)(base + i));
+		}
+
+		idx_wr(sc, r->cons_slot, 0);
+		r->shadow = (uint32_t)fill;
+		idx_publish(sc, r->prod_slot, r->shadow);
+		total += fill;
 	}
 
-	idx_wr(sc, r->cons_slot, 0);
-	r->shadow = (uint32_t)fill;
-	idx_publish(sc, r->prod_slot, r->shadow);
-
-	device_printf(sc->fac.dev, "giu: buffer pool filled with %d of %d x %d B\n",
-	    fill, r->len, sc->buf_size);
+	device_printf(sc->fac.dev, "giu: %d buffers of %d B across %d pools\n",
+	    total, sc->buf_size, NPUGIU_NUM_QS);
 }
 
 /*
@@ -1186,7 +1278,7 @@ static int
 npugiu_bringup(struct npugiu_softc *sc)
 {
 	uint8_t p[AGNIC_MGMT_DESC_DATA_LEN];
-	int err;
+	int err, q;
 
 	mtx_assert(&sc->mtx, MA_OWNED);
 
@@ -1219,47 +1311,79 @@ npugiu_bringup(struct npugiu_softc *sc)
 	p[AGNIC_P_INIT_EGRESS_SCHED] = AGNIC_ES_STRICT_SCHED;
 	STEP(AGNIC_CC_PF_INIT, 0x10, "PF_INIT");
 
-	/* 2. the ingress class */
+	/*
+	 * 2. the ingress class.
+	 *
+	 * The hash type is not decoration. The vendor leaves it at NONE for a single queue and
+	 * sets it to the RSS mode as soon as there is more than one, because with several queues
+	 * the device has to decide which one a frame belongs in. Its default RSS mode works out
+	 * to the two-tuple hash, so that is what this asks for.
+	 */
 	memset(p, 0, sizeof(p));
 	le32enc(p + AGNIC_P_ITC_TC, 0);
-	le32enc(p + AGNIC_P_ITC_NUM_QUEUES, 1);
+	le32enc(p + AGNIC_P_ITC_NUM_QUEUES, NPUGIU_NUM_QS);
 	le32enc(p + AGNIC_P_ITC_PKT_OFFSET, (uint32_t)npugiu_pkt_offset);
-	p[AGNIC_P_ITC_HASH_TYPE] = AGNIC_ING_HASH_NONE;
+	p[AGNIC_P_ITC_HASH_TYPE] = NPUGIU_NUM_QS > 1 ? AGNIC_ING_HASH_2_TUPLE :
+	    AGNIC_ING_HASH_NONE;
 	STEP(AGNIC_CC_PF_INGRESS_TC_ADD, 0x10, "INGRESS_TC_ADD");
 
-	/* 3. the receive queue, which carries its buffer pool with it */
-	memset(p, 0, sizeof(p));
-	le64enc(p + AGNIC_P_IQ_PHYS_ADDR, (uint64_t)sc->rx.phys);
-	le32enc(p + AGNIC_P_IQ_PROD_OFFS, sc->rx.prod_slot);
-	le32enc(p + AGNIC_P_IQ_CONS_OFFS, sc->rx.cons_slot);
-	le64enc(p + AGNIC_P_IQ_BPOOL_PHYS_ADDR, (uint64_t)sc->bp.phys);
-	le32enc(p + AGNIC_P_IQ_BPOOL_PROD_OFFS, sc->bp.prod_slot);
-	le32enc(p + AGNIC_P_IQ_BPOOL_CONS_OFFS, sc->bp.cons_slot);
-	le32enc(p + AGNIC_P_IQ_LEN, (uint32_t)sc->rx.len);
-	le32enc(p + AGNIC_P_IQ_MSIX_ID, (uint32_t)sc->fac.first_msix);
-	le32enc(p + AGNIC_P_IQ_TC, 0);
-	le32enc(p + AGNIC_P_IQ_BUF_SIZE, (uint32_t)sc->buf_size);
-	STEP(AGNIC_CC_PF_INGRESS_DATA_Q_ADD, 0x30, "INGRESS_DATA_Q_ADD");
-	npugiu_queue_added(sc, "INGRESS_DATA_Q_ADD");
+	/*
+	 * 3. the receive queues, each carrying its own buffer pool.
+	 *
+	 * msix_id is zero throughout, which is what the vendor sends when it is not using
+	 * interrupts for the data path: its local variable is initialised to zero and only
+	 * overwritten when MSI-X is enabled. We poll, so zero it is - the field was carrying a
+	 * real doorbell index before, which is a difference from the working configuration and
+	 * not one there was any reason to introduce.
+	 */
+	for (q = 0; q < NPUGIU_NUM_QS; q++) {
+		memset(p, 0, sizeof(p));
+		le64enc(p + AGNIC_P_IQ_PHYS_ADDR, (uint64_t)sc->rx[q].phys);
+		le32enc(p + AGNIC_P_IQ_PROD_OFFS, sc->rx[q].prod_slot);
+		le32enc(p + AGNIC_P_IQ_CONS_OFFS, sc->rx[q].cons_slot);
+		le64enc(p + AGNIC_P_IQ_BPOOL_PHYS_ADDR, (uint64_t)sc->bp[q].phys);
+		le32enc(p + AGNIC_P_IQ_BPOOL_PROD_OFFS, sc->bp[q].prod_slot);
+		le32enc(p + AGNIC_P_IQ_BPOOL_CONS_OFFS, sc->bp[q].cons_slot);
+		le32enc(p + AGNIC_P_IQ_LEN, (uint32_t)sc->rx[q].len);
+		le32enc(p + AGNIC_P_IQ_MSIX_ID, 0);
+		le32enc(p + AGNIC_P_IQ_TC, 0);
+		le32enc(p + AGNIC_P_IQ_BUF_SIZE, (uint32_t)sc->buf_size);
+		STEP(AGNIC_CC_PF_INGRESS_DATA_Q_ADD, 0x30, "INGRESS_DATA_Q_ADD");
+		if (q == 0)
+			npugiu_queue_added(sc, "INGRESS_DATA_Q_ADD");
+	}
 
-	/* 4. the egress class */
+	/*
+	 * 4. the egress class. num_queues counts every queue across every DMA engine, which is
+	 * why the vendor multiplies; the device told us it has one engine.
+	 */
 	memset(p, 0, sizeof(p));
 	le32enc(p + AGNIC_P_ETC_TC, 0);
-	le32enc(p + AGNIC_P_ETC_NUM_QUEUES, 1);
-	le32enc(p + AGNIC_P_ETC_NUM_Q_PER_DMA, 1);
+	le32enc(p + AGNIC_P_ETC_NUM_QUEUES,
+	    NPUGIU_NUM_QS * (sc->cap_dma_engines != 0 ? sc->cap_dma_engines : 1));
+	le32enc(p + AGNIC_P_ETC_NUM_Q_PER_DMA, NPUGIU_NUM_QS);
 	STEP(AGNIC_CC_PF_EGRESS_TC_ADD, 0x0c, "EGRESS_TC_ADD");
 
-	/* 5. the transmit queue */
-	memset(p, 0, sizeof(p));
-	le64enc(p + AGNIC_P_EQ_PHYS_ADDR, (uint64_t)sc->tx.phys);
-	le32enc(p + AGNIC_P_EQ_PROD_OFFS, sc->tx.prod_slot);
-	le32enc(p + AGNIC_P_EQ_CONS_OFFS, sc->tx.cons_slot);
-	le32enc(p + AGNIC_P_EQ_LEN, (uint32_t)sc->tx.len);
-	le32enc(p + AGNIC_P_EQ_WRR_WEIGHT, 1);
-	le32enc(p + AGNIC_P_EQ_TC, 0);
-	le32enc(p + AGNIC_P_EQ_MSIX_ID, (uint32_t)(sc->fac.first_msix + 1));
-	STEP(AGNIC_CC_PF_EGRESS_DATA_Q_ADD, 0x20, "EGRESS_DATA_Q_ADD");
-	npugiu_queue_added(sc, "EGRESS_DATA_Q_ADD");
+	/* 5. the transmit queues */
+	for (q = 0; q < NPUGIU_NUM_QS; q++) {
+		memset(p, 0, sizeof(p));
+		le64enc(p + AGNIC_P_EQ_PHYS_ADDR, (uint64_t)sc->tx[q].phys);
+		le32enc(p + AGNIC_P_EQ_PROD_OFFS, sc->tx[q].prod_slot);
+		le32enc(p + AGNIC_P_EQ_CONS_OFFS, sc->tx[q].cons_slot);
+		le32enc(p + AGNIC_P_EQ_LEN, (uint32_t)sc->tx[q].len);
+		/*
+		 * Zero, and not one. The vendor hardcodes zero with the comment "Meanwhile, we
+		 * support only strict prio", which is the same scheduler PF_INIT asks for. What
+		 * the device does with a nonzero weight under strict scheduling is not written
+		 * down anywhere, and there is no reason to be the one finding out.
+		 */
+		le32enc(p + AGNIC_P_EQ_WRR_WEIGHT, 0);
+		le32enc(p + AGNIC_P_EQ_TC, 0);
+		le32enc(p + AGNIC_P_EQ_MSIX_ID, 0);
+		STEP(AGNIC_CC_PF_EGRESS_DATA_Q_ADD, 0x20, "EGRESS_DATA_Q_ADD");
+		if (q == 0)
+			npugiu_queue_added(sc, "EGRESS_DATA_Q_ADD");
+	}
 
 	/* 6. and that is the configuration */
 	memset(p, 0, sizeof(p));
@@ -1268,9 +1392,8 @@ npugiu_bringup(struct npugiu_softc *sc)
 	/* 7. buffers before the enable, never after */
 	npugiu_fill_bpool(sc);
 
-	memset(p, 0, sizeof(p));
 	/*
-	 * 7. the receive filter.
+	 * 8. the receive filter.
 	 *
 	 * Without this the link transmits and never receives, which is not obvious from either
 	 * end: every command is answered, the rings are consumed, and nothing arrives. None of
@@ -1312,8 +1435,7 @@ npugiu_bringup(struct npugiu_softc *sc)
 		sc->link = (int)le32dec(sc->answer + AGNIC_R_LINK_STATUS);
 		device_printf(sc->fac.dev, "giu: the device reports the link %s\n",
 		    sc->link != 0 ? "up" : "down");
-	}
-	else
+	} else
 		device_printf(sc->fac.dev, "giu: the far side would not report link status\n");
 
 #undef SOFT_STEP
@@ -1354,22 +1476,122 @@ static int
 npugiu_sysctl_rings(SYSCTL_HANDLER_ARGS)
 {
 	struct npugiu_softc *sc = arg1;
-	char buf[192];
-	uint32_t txp, txc, rxp, rxc, bpp, bpc;
+	uint32_t v[NPUGIU_NUM_QS][6];
+	char buf[NPUGIU_NUM_QS * 96 + 1];
+	int q, n = 0;
 
 	GIU_LOCK(sc);
-	txp = idx_rd(sc, sc->tx.prod_slot);
-	txc = idx_rd(sc, sc->tx.cons_slot);
-	rxp = idx_rd(sc, sc->rx.prod_slot);
-	rxc = idx_rd(sc, sc->rx.cons_slot);
-	bpp = idx_rd(sc, sc->bp.prod_slot);
-	bpc = idx_rd(sc, sc->bp.cons_slot);
+	for (q = 0; q < NPUGIU_NUM_QS; q++) {
+		v[q][0] = idx_rd(sc, sc->tx[q].prod_slot);
+		v[q][1] = idx_rd(sc, sc->tx[q].cons_slot);
+		v[q][2] = idx_rd(sc, sc->rx[q].prod_slot);
+		v[q][3] = idx_rd(sc, sc->rx[q].cons_slot);
+		v[q][4] = idx_rd(sc, sc->bp[q].prod_slot);
+		v[q][5] = idx_rd(sc, sc->bp[q].cons_slot);
+	}
 	GIU_UNLOCK(sc);
 
-	snprintf(buf, sizeof(buf),
-	    "tx prod %u cons %u | rx prod %u cons %u | bpool prod %u cons %u",
-	    txp, txc, rxp, rxc, bpp, bpc);
+	buf[0] = '\0';
+	for (q = 0; q < NPUGIU_NUM_QS && n < (int)sizeof(buf) - 1; q++)
+		n += snprintf(buf + n, sizeof(buf) - n,
+		    "q%d tx %u/%u rx %u/%u bpool %u/%u%s", q,
+		    v[q][0], v[q][1], v[q][2], v[q][3], v[q][4], v[q][5],
+		    q == NPUGIU_NUM_QS - 1 ? "" : " | ");
+
 	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
+}
+
+/*
+ * The device's own packet counters, asked for on demand.
+ *
+ * This is the question the host cannot answer by itself: whether the coprocessor has frames for
+ * us at all. If rx_packets climbs while our pools stay untouched, it has them and is refusing to
+ * hand them over, and rx_bm_dropped says whether it is for want of a buffer. If rx_packets stays
+ * at zero, nothing is reaching it and the fault is further out than this driver.
+ */
+static int
+npugiu_sysctl_stats(SYSCTL_HANDLER_ARGS)
+{
+	struct npugiu_softc *sc = arg1;
+	uint8_t p[AGNIC_MGMT_DESC_DATA_LEN];
+	uint8_t a[AGNIC_R_ST_SIZE];
+	char buf[512];
+	int err, len;
+
+	GIU_LOCK(sc);
+	memset(p, 0, sizeof(p));
+	p[AGNIC_P_STATS_RESET] = 0;		/* read, do not clear */
+	err = npugiu_command(sc, AGNIC_CC_PF_GET_STATISTICS, p, AGNIC_P_STATS_LEN);
+	len = sc->answer_len;
+	if (err == 0 && len >= (int)sizeof(a))
+		memcpy(a, sc->answer, sizeof(a));
+	GIU_UNLOCK(sc);
+
+	if (err != 0)
+		snprintf(buf, sizeof(buf), "the device refused to report statistics (%d)", err);
+	else if (len < (int)sizeof(a))
+		snprintf(buf, sizeof(buf),
+		    "the device answered with %d bytes, too short to be statistics", len);
+	else
+		snprintf(buf, sizeof(buf),
+		    "rx %ju packets %ju bytes %ju unicast %ju errors | "
+		    "dropped: fullq %ju bm %ju early %ju fifo %ju cls %ju | "
+		    "tx %ju packets %ju bytes %ju unicast %ju errors",
+		    (uintmax_t)le64dec(a + AGNIC_R_ST_RX_PACKETS),
+		    (uintmax_t)le64dec(a + AGNIC_R_ST_RX_BYTES),
+		    (uintmax_t)le64dec(a + AGNIC_R_ST_RX_UNICAST),
+		    (uintmax_t)le64dec(a + AGNIC_R_ST_RX_ERRORS),
+		    (uintmax_t)le64dec(a + AGNIC_R_ST_RX_FULLQ_DROP),
+		    (uintmax_t)le64dec(a + AGNIC_R_ST_RX_BM_DROP),
+		    (uintmax_t)le64dec(a + AGNIC_R_ST_RX_EARLY_DROP),
+		    (uintmax_t)le64dec(a + AGNIC_R_ST_RX_FIFO_DROP),
+		    (uintmax_t)le64dec(a + AGNIC_R_ST_RX_CLS_DROP),
+		    (uintmax_t)le64dec(a + AGNIC_R_ST_TX_PACKETS),
+		    (uintmax_t)le64dec(a + AGNIC_R_ST_TX_BYTES),
+		    (uintmax_t)le64dec(a + AGNIC_R_ST_TX_UNICAST),
+		    (uintmax_t)le64dec(a + AGNIC_R_ST_TX_ERRORS));
+
+	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
+}
+
+/*
+ * Loopback, and this is the decisive instrument.
+ *
+ * With it on, a frame this host transmits should come straight back up its own receive path,
+ * with nothing on the wire involved and no forwarding decision taken anywhere. If it returns,
+ * every ring, index, barrier, buffer pool and cookie on this side is correct and the silence is
+ * the coprocessor declining to forward traffic it has. If it does not return, the fault is here.
+ * There is no other experiment that separates those two as cleanly.
+ */
+static int
+npugiu_sysctl_loopback(SYSCTL_HANDLER_ARGS)
+{
+	struct npugiu_softc *sc = arg1;
+	uint8_t p[AGNIC_MGMT_DESC_DATA_LEN];
+	int on, err;
+
+	on = sc->loopback;
+	err = sysctl_handle_int(oidp, &on, 0, req);
+	if (err != 0 || req->newptr == NULL)
+		return (err);
+
+	on = on != 0;
+
+	GIU_LOCK(sc);
+	memset(p, 0, sizeof(p));
+	p[AGNIC_P_LOOPBACK] = (uint8_t)on;
+	err = npugiu_command(sc, AGNIC_CC_PF_SET_LOOPBACK, p, AGNIC_P_LOOPBACK_LEN);
+	if (err == 0)
+		sc->loopback = on;
+	GIU_UNLOCK(sc);
+
+	if (err != 0)
+		device_printf(sc->fac.dev, "giu: the device refused loopback %s (%d)\n",
+		    on ? "on" : "off", err);
+	else
+		device_printf(sc->fac.dev, "giu: loopback %s\n", on ? "on" : "off");
+
+	return (err);
 }
 
 /*
@@ -1399,7 +1621,8 @@ npugiu_add_sysctls(struct npugiu_softc *sc)
 	    "receive buffer size, as the device asked for it");
 	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "rings",
 	    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0, npugiu_sysctl_rings, "A",
-	    "both ends of the transmit, receive and buffer-pool rings, read live");
+	    "both ends of every transmit, receive and buffer-pool ring, read live, as "
+	    "producer/consumer");
 
 	SYSCTL_ADD_U64(ctx, child, OID_AUTO, "commands", CTLFLAG_RD, &sc->commands, 0,
 	    "commands posted on the management channel");
@@ -1411,6 +1634,12 @@ npugiu_add_sysctls(struct npugiu_softc *sc)
 	    "the device's own account of the host link: 1 up, 0 down");
 	SYSCTL_ADD_U64(ctx, child, OID_AUTO, "link_changes", CTLFLAG_RD, &sc->link_changes, 0,
 	    "link-change notifications received");
+	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "stats",
+	    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0, npugiu_sysctl_stats, "A",
+	    "the device's own packet counters, asked for when this is read");
+	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "loopback",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0, npugiu_sysctl_loopback, "I",
+	    "send transmitted frames straight back up the receive path");
 
 	SYSCTL_ADD_U64(ctx, child, OID_AUTO, "rx_packets", CTLFLAG_RD, &sc->rx_packets, 0,
 	    "frames received");
@@ -1432,6 +1661,14 @@ npugiu_add_sysctls(struct npugiu_softc *sc)
 	SYSCTL_ADD_U64(ctx, child, OID_AUTO, "tx_toolong", CTLFLAG_RD, &sc->tx_toolong, 0,
 	    "frames refused because they did not fit a buffer");
 
+	for (i = 0; i < NPUGIU_NUM_QS; i++) {
+		char name[16];
+
+		snprintf(name, sizeof(name), "rx_q%d", i);
+		SYSCTL_ADD_U64(ctx, child, OID_AUTO, name, CTLFLAG_RD, &sc->rx_q[i], 0,
+		    "frames received on this receive queue");
+	}
+
 	node = SYSCTL_ADD_NODE(ctx, child, OID_AUTO, "rx_port", CTLFLAG_RD | CTLFLAG_MPSAFE, NULL,
 	    "frames received, counted by the port identifier they arrived with");
 	if (node == NULL)
@@ -1451,7 +1688,7 @@ npugiu_attach(struct npuep_facility *fac)
 {
 	struct npugiu_softc *sc;
 	uint32_t duse, need, lo, hi;
-	int err;
+	int err, i, q;
 
 	if (npugiu_sc != NULL)
 		return (EBUSY);
@@ -1569,19 +1806,26 @@ npugiu_attach(struct npuep_facility *fac)
 	 * machine that keeps it is easier to work on than one that tears everything down.
 	 */
 	GIU_LOCK(sc);
-	err = npugiu_alloc_ring(sc, &sc->tx, NPUGIU_DATA_Q_LEN, AGNIC_TXD_SIZE, "transmit");
+	err = 0;
+	for (i = 0; i < NPUGIU_NUM_QS && err == 0; i++) {
+		char what[24];
+
+		snprintf(what, sizeof(what), "transmit %d", i);
+		err = npugiu_alloc_ring(sc, &sc->tx[i], NPUGIU_DATA_Q_LEN, AGNIC_TXD_SIZE, what);
+		if (err != 0)
+			break;
+		snprintf(what, sizeof(what), "receive %d", i);
+		err = npugiu_alloc_ring(sc, &sc->rx[i], NPUGIU_DATA_Q_LEN, AGNIC_RXD_SIZE, what);
+		if (err != 0)
+			break;
+		snprintf(what, sizeof(what), "buffer pool %d", i);
+		err = npugiu_alloc_ring(sc, &sc->bp[i], NPUGIU_DATA_Q_LEN, AGNIC_BPD_SIZE, what);
+	}
 	if (err == 0)
-		err = npugiu_alloc_ring(sc, &sc->rx, NPUGIU_DATA_Q_LEN, AGNIC_RXD_SIZE, "receive");
-	if (err == 0)
-		err = npugiu_alloc_ring(sc, &sc->bp, NPUGIU_DATA_Q_LEN, AGNIC_BPD_SIZE,
-		    "buffer pool");
-	if (err == 0)
-		err = npugiu_alloc_buffers(sc, NPUGIU_DATA_Q_LEN);
+		err = npugiu_alloc_buffers(sc, NPUGIU_NUM_QS * NPUGIU_DATA_Q_LEN);
 	if (err == 0)
 		err = npugiu_alloc_txbuffers(sc, NPUGIU_DATA_Q_LEN);
 	if (err == 0) {
-		int i;
-
 		/*
 		 * The address this end answers to. The coprocessor advertises the trunk's own,
 		 * and taking it unchanged would put two interfaces with one address on the same
@@ -1598,9 +1842,10 @@ npugiu_attach(struct npuep_facility *fac)
 		 * device has filled from one nobody has touched yet. The vendor added it after
 		 * the fact; here it goes in before the ring is ever handed over.
 		 */
-		for (i = 0; i < sc->rx.len; i++)
-			le64enc(desc_at(&sc->rx, (uint32_t)i) + AGNIC_RXD_COOKIE,
-			    AGNIC_COOKIE_DRIVER_WATERMARK);
+		for (q = 0; q < NPUGIU_NUM_QS; q++)
+			for (i = 0; i < sc->rx[q].len; i++)
+				le64enc(desc_at(&sc->rx[q], (uint32_t)i) + AGNIC_RXD_COOKIE,
+				    AGNIC_COOKIE_DRIVER_WATERMARK);
 		sc->out_port = NPUGIU_DEFAULT_PORT;
 		err = npugiu_bringup(sc);
 	}
@@ -1624,9 +1869,11 @@ npugiu_attach(struct npuep_facility *fac)
 
 fail:
 	npugiu_free_buffers(sc);
-	npugiu_free_ring(sc, &sc->bp);
-	npugiu_free_ring(sc, &sc->rx);
-	npugiu_free_ring(sc, &sc->tx);
+	for (q = 0; q < NPUGIU_NUM_QS; q++) {
+		npugiu_free_ring(sc, &sc->bp[q]);
+		npugiu_free_ring(sc, &sc->rx[q]);
+		npugiu_free_ring(sc, &sc->tx[q]);
+	}
 	npugiu_free_ring(sc, &sc->notif);
 	npugiu_free_ring(sc, &sc->cmd);
 	callout_drain(&sc->poll);
@@ -1640,6 +1887,7 @@ npugiu_detach(void)
 {
 	struct npugiu_softc *sc = npugiu_sc;
 	uint32_t st;
+	int q;
 
 	if (sc == NULL)
 		return;
@@ -1680,9 +1928,11 @@ npugiu_detach(void)
 		bus_barrier(sc->fac.res, sc->fac.off, AGNIC_CFG_SIZE, BUS_SPACE_BARRIER_WRITE);
 
 		npugiu_free_buffers(sc);
-		npugiu_free_ring(sc, &sc->bp);
-		npugiu_free_ring(sc, &sc->rx);
-		npugiu_free_ring(sc, &sc->tx);
+		for (q = 0; q < NPUGIU_NUM_QS; q++) {
+			npugiu_free_ring(sc, &sc->bp[q]);
+			npugiu_free_ring(sc, &sc->rx[q]);
+			npugiu_free_ring(sc, &sc->tx[q]);
+		}
 		npugiu_free_ring(sc, &sc->notif);
 		npugiu_free_ring(sc, &sc->cmd);
 	} else {
