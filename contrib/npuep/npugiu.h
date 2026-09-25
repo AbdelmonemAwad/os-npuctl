@@ -167,6 +167,39 @@
  * from the other end: mv_pport.ko calls dev_set_promiscuity() on whatever device it is stacked
  * on, because a trunk carrying fourteen ports' traffic has no single address to filter for.
  */
+/*
+ * ---------------------------------------------------------------------------------------
+ * The answer to a command.
+ *
+ * EVERY reply begins with a one-byte status, and the payload follows it unaligned - the whole
+ * structure is under #pragma pack(1), so a u32 at +0x01 is a u32 at +0x01. This driver spent its
+ * first datapath ignoring that byte, which meant a refused queue and an accepted one were the
+ * same event from here.
+ * ---------------------------------------------------------------------------------------
+ */
+#define	AGNIC_R_STATUS			0x00	/* u8 */
+#define	  AGNIC_R_STATUS_OK		0
+#define	  AGNIC_R_STATUS_FAIL		1
+
+/* Every queue-add answers with the same pair. Zero is accepted; anything else is not. */
+#define	AGNIC_R_QADD_Q_INF		0x01	/* u64 */
+#define	AGNIC_R_QADD_BPOOL_INF		0x09	/* u64 */
+
+#define	AGNIC_R_LINK_STATUS		0x01	/* u32 */
+
+/*
+ * The buffer size is the device's to state, not the host's to choose. The vendor asks for this
+ * before it sizes anything, and the coprocessor here runs with a ten-kilobyte MTU, so a host that
+ * guesses 2048 is not obviously wrong - it is just not what was asked for.
+ */
+#define	AGNIC_R_CAP_FLAGS		0x01	/* u32 */
+#define	  AGNIC_CAP_SG			(1U << 0)
+#define	AGNIC_R_CAP_MAX_BUF_SIZE	0x05	/* u32 */
+#define	AGNIC_R_CAP_EGRESS_DMA		0x09	/* u8 */
+
+#define	AGNIC_P_MTU			0x00	/* u16 */
+#define	AGNIC_P_MTU_LEN			2
+
 #define	AGNIC_P_MAC_ADDR		0x00	/* six bytes */
 #define	AGNIC_P_MAC_ADDR_LEN		6
 #define	AGNIC_P_PROMISC			0x00	/* u8 */

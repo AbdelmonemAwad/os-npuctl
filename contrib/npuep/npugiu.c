@@ -99,7 +99,13 @@
  * two for the port identifier and sixty-four of metadata. See docs/giu.md.
  */
 #define	NPUGIU_DATA_Q_LEN	256
-#define	NPUGIU_BUF_SIZE		2048
+/*
+ * What a receive buffer holds if the coprocessor does not say otherwise, and the bounds we will
+ * accept when it does. Ten kilobytes covers the ten-kilobyte MTU its own fastpath runs with.
+ */
+#define	NPUGIU_BUF_DEFAULT	2048
+#define	NPUGIU_BUF_MIN		2048
+#define	NPUGIU_BUF_MAX		16384
 #define	NPUGIU_MTU		1500
 
 /*
@@ -125,6 +131,21 @@
  * that has a cable in it. Changeable at runtime through a sysctl.
  */
 #define	NPUGIU_DEFAULT_PORT	0x8800
+
+/*
+ * How far into a receive buffer the coprocessor is asked to place a frame.
+ *
+ * Its own management configuration declares "dflt_pkt_offset": 64, which is either a preference
+ * it will follow or a requirement it will not transmit without - and those two look identical
+ * from here until one of them is tried. So it is a loader tunable rather than a constant:
+ *
+ *	kenv hw.npuep.giu.pkt_offset=64
+ *
+ * before kldload. The receive path reads the offset back out of each descriptor either way, so
+ * changing this cannot on its own produce a misparsed frame.
+ */
+static int npugiu_pkt_offset = 0;
+TUNABLE_INT("hw.npuep.giu.pkt_offset", &npugiu_pkt_offset);
 
 struct npugiu_buf {
 	bus_dmamap_t	 map;
@@ -165,6 +186,10 @@ struct npugiu_softc {
 	struct npugiu_ring	 rx;
 	struct npugiu_ring	 bp;
 
+	int			 buf_size;	/* what the device asked for, or the default */
+	uint32_t		 cap_flags;
+	uint8_t			 cap_dma_engines;
+
 	bus_dma_tag_t		 buf_tag;
 	struct npugiu_buf	*buf;		/* receive buffers, handed to the pool */
 	struct npugiu_buf	*txbuf;		/* transmit buffers, one per descriptor */
@@ -194,6 +219,8 @@ struct npugiu_softc {
 	uint8_t			 answer[4 * AGNIC_MGMT_DESC_DATA_LEN];
 	int			 answer_len;
 
+	int			 link;		/* as the device last reported it */
+	uint64_t		 link_changes;
 	uint64_t		 commands, answers, notifications, drops;
 	uint64_t		 keepalives, late, multipart, overruns;
 };
@@ -493,7 +520,17 @@ npugiu_drain(struct npugiu_softc *sc)
 				sc->keepalives++;
 				break;
 			case AGNIC_NC_PF_LINK_CHANGE:
-				device_printf(sc->fac.dev, "giu: link change reported\n");
+				/*
+				 * The notification carries the new state as a u32 at the start
+				 * of its data. Keep it: this is the device's own account of
+				 * whether it considers the host link usable, and a device that
+				 * thinks the link is down answers every command, consumes every
+				 * transmit descriptor, and sends nothing back.
+				 */
+				sc->link = (int)le32dec(d + AGNIC_CMD_DATA);
+				sc->link_changes++;
+				device_printf(sc->fac.dev, "giu: the device reports the link %s\n",
+				    sc->link != 0 ? "up" : "down");
 				break;
 			default:
 				device_printf(sc->fac.dev,
@@ -574,7 +611,7 @@ npugiu_encap(struct npugiu_softc *sc, struct mbuf *m)
 
 	mtx_assert(&sc->mtx, MA_OWNED);
 
-	if (len <= 0 || len + NPUGIU_HDR_LEN > NPUGIU_BUF_SIZE) {
+	if (len <= 0 || len + NPUGIU_HDR_LEN > sc->buf_size) {
 		sc->tx_toolong++;
 		return (EMSGSIZE);
 	}
@@ -709,7 +746,7 @@ npugiu_rx(struct npugiu_softc *sc, int budget, struct mbuf **head, struct mbuf *
 		struct mbuf *m;
 		const uint8_t *src;
 		uint16_t port;
-		int len, n;
+		int len, n, off;
 
 		/*
 		 * Acquire against the producer index just read: the descriptor contents must not
@@ -729,13 +766,20 @@ npugiu_rx(struct npugiu_softc *sc, int budget, struct mbuf **head, struct mbuf *
 			sc->rx_bad++;
 			goto next;
 		}
-		if (total < NPUGIU_HDR_LEN + ETHER_HDR_LEN || total > NPUGIU_BUF_SIZE) {
+		/*
+		 * Where the frame starts is the descriptor's to say, not ours to assume. We ask
+		 * for one offset in INGRESS_TC_ADD; the far side reports what it actually used,
+		 * and only that second number can be trusted to find the frame.
+		 */
+		off = d[AGNIC_RXD_PKT_OFFSET];
+		if (off + (int)total > sc->buf_size ||
+		    total < NPUGIU_HDR_LEN + ETHER_HDR_LEN) {
 			sc->rx_bad++;
 			npugiu_bpool_return(sc, bufidx);
 			goto next;
 		}
 
-		src = sc->buf[bufidx].vaddr;
+		src = (const uint8_t *)sc->buf[bufidx].vaddr + off;
 		port = ((uint16_t)src[0] << 8) | src[1];
 		len = total - NPUGIU_HDR_LEN;
 
@@ -904,7 +948,15 @@ npugiu_tick(void *arg)
 	}
 }
 
-/* Post a command and wait for its answer. Called with the lock held. */
+/*
+ * Post a command, wait for its answer, and read the status byte in front of it. Called with the
+ * lock held.
+ *
+ * That last part is not a detail. An answer arriving is not the same as a command succeeding:
+ * the coprocessor replies to everything, and says whether it agreed in the first byte. A driver
+ * that only checks "did a reply come back" will configure a queue the device refused and then
+ * spend an afternoon wondering why nothing arrives on it.
+ */
 static int
 npugiu_command(struct npugiu_softc *sc, uint8_t code, const void *params, size_t plen)
 {
@@ -915,14 +967,42 @@ npugiu_command(struct npugiu_softc *sc, uint8_t code, const void *params, size_t
 		return (err);
 
 	for (i = 0; i < NPUGIU_CMD_WAIT; i++) {
-		if (sc->answered)
+		if (sc->answered) {
+			if (sc->answer_len < 1)
+				return (EBADMSG);
+			if (sc->answer[AGNIC_R_STATUS] != AGNIC_R_STATUS_OK) {
+				device_printf(sc->fac.dev,
+				    "giu: command 0x%02x refused, status %u\n",
+				    code, sc->answer[AGNIC_R_STATUS]);
+				return (EINVAL);
+			}
 			return (0);
+		}
 		if (!sc->running)
 			return (ENXIO);
 		msleep(&sc->answered, &sc->mtx, 0, "npugiu", hz / 100);
 	}
 	sc->waiting = 0;
 	return (ETIMEDOUT);
+}
+
+/*
+ * A queue-add answers with two more fields after the status byte. The header names them q_inf and
+ * bpool_inf and defines OK and ERR values for them - and then the vendor's own driver never reads
+ * either one, so which of "a handle" and "a status" they are is not established. Report them and
+ * do not act on them: guessing wrong here would refuse a queue the device had accepted, which is
+ * a worse failure than the one it would be trying to catch.
+ */
+static void
+npugiu_queue_added(struct npugiu_softc *sc, const char *what)
+{
+
+	if (sc->answer_len < AGNIC_R_QADD_BPOOL_INF + 8)
+		return;
+
+	device_printf(sc->fac.dev, "giu: %s answered q_inf 0x%jx bpool_inf 0x%jx\n", what,
+	    (uintmax_t)le64dec(sc->answer + AGNIC_R_QADD_Q_INF),
+	    (uintmax_t)le64dec(sc->answer + AGNIC_R_QADD_BPOOL_INF));
 }
 
 /*
@@ -976,7 +1056,7 @@ npugiu_alloc_buffers(struct npugiu_softc *sc, int n)
 	int i, err;
 
 	err = bus_dma_tag_create(sc->fac.parent_tag, 64, 0, NPUGIU_DMA_LOWADDR,
-	    BUS_SPACE_MAXADDR, NULL, NULL, NPUGIU_BUF_SIZE, 1, NPUGIU_BUF_SIZE, 0,
+	    BUS_SPACE_MAXADDR, NULL, NULL, sc->buf_size, 1, sc->buf_size, 0,
 	    NULL, NULL, &sc->buf_tag);
 	if (err != 0)
 		return (err);
@@ -992,7 +1072,7 @@ npugiu_alloc_buffers(struct npugiu_softc *sc, int n)
 		if (err != 0)
 			return (err);
 		err = bus_dmamap_load(sc->buf_tag, sc->buf[i].map, sc->buf[i].vaddr,
-		    NPUGIU_BUF_SIZE, npugiu_dmamap_cb, &pa, BUS_DMA_NOWAIT);
+		    sc->buf_size, npugiu_dmamap_cb, &pa, BUS_DMA_NOWAIT);
 		if (err != 0 || pa == 0)
 			return (err != 0 ? err : ENOMEM);
 		sc->buf[i].paddr = pa;
@@ -1015,12 +1095,47 @@ npugiu_alloc_txbuffers(struct npugiu_softc *sc, int n)
 		if (err != 0)
 			return (err);
 		err = bus_dmamap_load(sc->buf_tag, sc->txbuf[i].map, sc->txbuf[i].vaddr,
-		    NPUGIU_BUF_SIZE, npugiu_dmamap_cb, &pa, BUS_DMA_NOWAIT);
+		    sc->buf_size, npugiu_dmamap_cb, &pa, BUS_DMA_NOWAIT);
 		if (err != 0 || pa == 0)
 			return (err != 0 ? err : ENOMEM);
 		sc->txbuf[i].paddr = pa;
 	}
 	return (0);
+}
+
+/*
+ * CC_GET_CAPABILITIES, which is where the buffer size comes from.
+ */
+static void
+npugiu_capabilities(struct npugiu_softc *sc)
+{
+	uint8_t p[AGNIC_MGMT_DESC_DATA_LEN];
+	uint32_t want;
+
+	mtx_assert(&sc->mtx, MA_OWNED);
+
+	sc->buf_size = NPUGIU_BUF_DEFAULT;
+
+	memset(p, 0, sizeof(p));
+	if (npugiu_command(sc, AGNIC_CC_GET_CAPABILITIES, p, 0) != 0 ||
+	    sc->answer_len < AGNIC_R_CAP_EGRESS_DMA + 1) {
+		device_printf(sc->fac.dev,
+		    "giu: no capabilities from the device - using %d byte buffers\n",
+		    sc->buf_size);
+		return;
+	}
+
+	sc->cap_flags = le32dec(sc->answer + AGNIC_R_CAP_FLAGS);
+	sc->cap_dma_engines = sc->answer[AGNIC_R_CAP_EGRESS_DMA];
+	want = le32dec(sc->answer + AGNIC_R_CAP_MAX_BUF_SIZE);
+
+	if (want >= NPUGIU_BUF_MIN && want <= NPUGIU_BUF_MAX)
+		sc->buf_size = (int)want;
+
+	device_printf(sc->fac.dev,
+	    "giu: capabilities flags 0x%08x, buffer %u bytes (using %d), %u egress DMA engine%s\n",
+	    sc->cap_flags, want, sc->buf_size, sc->cap_dma_engines,
+	    sc->cap_dma_engines == 1 ? "" : "s");
 }
 
 /*
@@ -1059,7 +1174,7 @@ npugiu_fill_bpool(struct npugiu_softc *sc)
 	idx_publish(sc, r->prod_slot, r->shadow);
 
 	device_printf(sc->fac.dev, "giu: buffer pool filled with %d of %d x %d B\n",
-	    fill, r->len, NPUGIU_BUF_SIZE);
+	    fill, r->len, sc->buf_size);
 }
 
 /*
@@ -1108,7 +1223,7 @@ npugiu_bringup(struct npugiu_softc *sc)
 	memset(p, 0, sizeof(p));
 	le32enc(p + AGNIC_P_ITC_TC, 0);
 	le32enc(p + AGNIC_P_ITC_NUM_QUEUES, 1);
-	le32enc(p + AGNIC_P_ITC_PKT_OFFSET, 0);
+	le32enc(p + AGNIC_P_ITC_PKT_OFFSET, (uint32_t)npugiu_pkt_offset);
 	p[AGNIC_P_ITC_HASH_TYPE] = AGNIC_ING_HASH_NONE;
 	STEP(AGNIC_CC_PF_INGRESS_TC_ADD, 0x10, "INGRESS_TC_ADD");
 
@@ -1123,8 +1238,9 @@ npugiu_bringup(struct npugiu_softc *sc)
 	le32enc(p + AGNIC_P_IQ_LEN, (uint32_t)sc->rx.len);
 	le32enc(p + AGNIC_P_IQ_MSIX_ID, (uint32_t)sc->fac.first_msix);
 	le32enc(p + AGNIC_P_IQ_TC, 0);
-	le32enc(p + AGNIC_P_IQ_BUF_SIZE, NPUGIU_BUF_SIZE);
+	le32enc(p + AGNIC_P_IQ_BUF_SIZE, (uint32_t)sc->buf_size);
 	STEP(AGNIC_CC_PF_INGRESS_DATA_Q_ADD, 0x30, "INGRESS_DATA_Q_ADD");
+	npugiu_queue_added(sc, "INGRESS_DATA_Q_ADD");
 
 	/* 4. the egress class */
 	memset(p, 0, sizeof(p));
@@ -1143,6 +1259,7 @@ npugiu_bringup(struct npugiu_softc *sc)
 	le32enc(p + AGNIC_P_EQ_TC, 0);
 	le32enc(p + AGNIC_P_EQ_MSIX_ID, (uint32_t)(sc->fac.first_msix + 1));
 	STEP(AGNIC_CC_PF_EGRESS_DATA_Q_ADD, 0x20, "EGRESS_DATA_Q_ADD");
+	npugiu_queue_added(sc, "EGRESS_DATA_Q_ADD");
 
 	/* 6. and that is the configuration */
 	memset(p, 0, sizeof(p));
@@ -1161,6 +1278,10 @@ npugiu_bringup(struct npugiu_softc *sc)
 	 * keeping and worth being told about, and the failure is named where it happens.
 	 */
 	memset(p, 0, sizeof(p));
+	le16enc(p + AGNIC_P_MTU, NPUGIU_MTU);
+	SOFT_STEP(AGNIC_CC_PF_MTU, AGNIC_P_MTU_LEN, "PF_MTU");
+
+	memset(p, 0, sizeof(p));
 	memcpy(p + AGNIC_P_MAC_ADDR, sc->hostmac, AGNIC_P_MAC_ADDR_LEN);
 	SOFT_STEP(AGNIC_CC_PF_MAC_ADDR, AGNIC_P_MAC_ADDR_LEN, "PF_MAC_ADDR");
 
@@ -1178,6 +1299,22 @@ npugiu_bringup(struct npugiu_softc *sc)
 	SOFT_STEP(AGNIC_CC_PF_MC_PROMISC, AGNIC_P_PROMISC_LEN, "PF_MC_PROMISC");
 
 	STEP(AGNIC_CC_PF_ENABLE, 0, "PF_ENABLE");
+
+	/*
+	 * And finally ask what the far side thinks the link is doing. This is not decoration: a
+	 * coprocessor that believes the host link is down will accept every command, consume every
+	 * transmit descriptor and never send a frame the other way, which is indistinguishable
+	 * from a receive path that is simply broken.
+	 */
+	memset(p, 0, sizeof(p));
+	if (npugiu_command(sc, AGNIC_CC_PF_LINK_STATUS, p, 0) == 0 &&
+	    sc->answer_len >= AGNIC_R_LINK_STATUS + 4) {
+		sc->link = (int)le32dec(sc->answer + AGNIC_R_LINK_STATUS);
+		device_printf(sc->fac.dev, "giu: the device reports the link %s\n",
+		    sc->link != 0 ? "up" : "down");
+	}
+	else
+		device_printf(sc->fac.dev, "giu: the far side would not report link status\n");
 
 #undef SOFT_STEP
 #undef STEP
@@ -1207,6 +1344,35 @@ npugiu_wait_status(struct npugiu_softc *sc, uint32_t bit, int ticks, const char 
 }
 
 /*
+ * Both ends of all three data rings, read live.
+ *
+ * This exists because "nothing is arriving" has two completely different causes that look the
+ * same from a packet counter: a coprocessor that is not producing, and a host that is not
+ * reading what was produced. The device's own producer index separates them in one line.
+ */
+static int
+npugiu_sysctl_rings(SYSCTL_HANDLER_ARGS)
+{
+	struct npugiu_softc *sc = arg1;
+	char buf[192];
+	uint32_t txp, txc, rxp, rxc, bpp, bpc;
+
+	GIU_LOCK(sc);
+	txp = idx_rd(sc, sc->tx.prod_slot);
+	txc = idx_rd(sc, sc->tx.cons_slot);
+	rxp = idx_rd(sc, sc->rx.prod_slot);
+	rxc = idx_rd(sc, sc->rx.cons_slot);
+	bpp = idx_rd(sc, sc->bp.prod_slot);
+	bpc = idx_rd(sc, sc->bp.cons_slot);
+	GIU_UNLOCK(sc);
+
+	snprintf(buf, sizeof(buf),
+	    "tx prod %u cons %u | rx prod %u cons %u | bpool prod %u cons %u",
+	    txp, txc, rxp, rxc, bpp, bpc);
+	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
+}
+
+/*
  * The counters. This is the whole verification surface for the datapath: what went out, what came
  * in, which physical port it came in on, and every way a frame was refused.
  */
@@ -1227,6 +1393,24 @@ npugiu_add_sysctls(struct npugiu_softc *sc)
 
 	SYSCTL_ADD_U32(ctx, child, OID_AUTO, "out_port", CTLFLAG_RW, &sc->out_port, 0,
 	    "port identifier written in front of every transmitted frame");
+	SYSCTL_ADD_INT(ctx, child, OID_AUTO, "pkt_offset", CTLFLAG_RD, &npugiu_pkt_offset, 0,
+	    "offset the ingress class was asked to place frames at");
+	SYSCTL_ADD_INT(ctx, child, OID_AUTO, "buf_size", CTLFLAG_RD, &sc->buf_size, 0,
+	    "receive buffer size, as the device asked for it");
+	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "rings",
+	    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0, npugiu_sysctl_rings, "A",
+	    "both ends of the transmit, receive and buffer-pool rings, read live");
+
+	SYSCTL_ADD_U64(ctx, child, OID_AUTO, "commands", CTLFLAG_RD, &sc->commands, 0,
+	    "commands posted on the management channel");
+	SYSCTL_ADD_U64(ctx, child, OID_AUTO, "answers", CTLFLAG_RD, &sc->answers, 0,
+	    "answers received");
+	SYSCTL_ADD_U64(ctx, child, OID_AUTO, "notifications", CTLFLAG_RD, &sc->notifications, 0,
+	    "unsolicited notifications from the coprocessor");
+	SYSCTL_ADD_INT(ctx, child, OID_AUTO, "link", CTLFLAG_RD, &sc->link, 0,
+	    "the device's own account of the host link: 1 up, 0 down");
+	SYSCTL_ADD_U64(ctx, child, OID_AUTO, "link_changes", CTLFLAG_RD, &sc->link_changes, 0,
+	    "link-change notifications received");
 
 	SYSCTL_ADD_U64(ctx, child, OID_AUTO, "rx_packets", CTLFLAG_RD, &sc->rx_packets, 0,
 	    "frames received");
@@ -1367,6 +1551,17 @@ npugiu_attach(struct npuep_facility *fac)
 	}
 
 	device_printf(fac->dev, "giu: MGMT_ECHO answered - the command channel is up\n");
+
+	/*
+	 * Ask the device how large a receive buffer it wants before allocating any. The vendor's
+	 * driver does this first of all and sizes everything from the answer; this one guessed
+	 * 2048 for its first datapath, against a coprocessor whose own fastpath runs a ten
+	 * kilobyte MTU. A refusal here is not fatal - the default is still a legal size - but it
+	 * is worth saying, because it is the number every later bound depends on.
+	 */
+	GIU_LOCK(sc);
+	npugiu_capabilities(sc);
+	GIU_UNLOCK(sc);
 
 	/*
 	 * With the channel proved, hand over the datapath. Its failure leaves the command channel
