@@ -158,6 +158,22 @@
 #define	AGNIC_P_EQ_MSIX_ID		0x1c	/* u32 */
 
 /* CC_PF_INGRESS_TC_ADD */
+/*
+ * PF_MAC_ADDR carries six bytes and nothing else. PF_PROMISC and PF_MC_PROMISC carry one.
+ *
+ * Why these are sent at all: the coprocessor's side of this link is a NIC with a receive filter,
+ * and until it is told an address it has none - which is what an interface that transmits
+ * perfectly and receives nothing looks like. The vendor's own host driver reaches the same place
+ * from the other end: mv_pport.ko calls dev_set_promiscuity() on whatever device it is stacked
+ * on, because a trunk carrying fourteen ports' traffic has no single address to filter for.
+ */
+#define	AGNIC_P_MAC_ADDR		0x00	/* six bytes */
+#define	AGNIC_P_MAC_ADDR_LEN		6
+#define	AGNIC_P_PROMISC			0x00	/* u8 */
+#define	AGNIC_P_PROMISC_LEN		1
+#define	  AGNIC_PROMISC_DISABLE		0
+#define	  AGNIC_PROMISC_ENABLE		1
+
 #define	AGNIC_P_ITC_TC			0x00	/* u32 */
 #define	AGNIC_P_ITC_NUM_QUEUES		0x04	/* u32 */
 #define	AGNIC_P_ITC_PKT_OFFSET		0x08	/* u32 */
