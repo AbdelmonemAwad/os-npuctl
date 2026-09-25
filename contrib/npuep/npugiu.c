@@ -145,10 +145,16 @@ struct npugiu_softc {
 	int			 waiting;
 	uint16_t		 wait_tag;
 	int			 answered;
-	uint8_t			 answer[AGNIC_MGMT_DESC_DATA_LEN];
+	/*
+	 * An answer can span descriptors. flags carries a buffer position - SINGLE, FIRST_MID or
+	 * LAST - and a run is only complete on SINGLE or LAST. Four descriptors is 224 bytes,
+	 * comfortably more than the largest response the header defines.
+	 */
+	uint8_t			 answer[4 * AGNIC_MGMT_DESC_DATA_LEN];
+	int			 answer_len;
 
 	uint64_t		 commands, answers, notifications, drops;
-	uint64_t		 keepalives, late;
+	uint64_t		 keepalives, late, multipart, overruns;
 };
 
 static struct npugiu_softc *npugiu_sc;
@@ -408,6 +414,7 @@ npugiu_post(struct npugiu_softc *sc, uint8_t code, const void *params, size_t pl
 	sc->commands++;
 	sc->waiting = want_resp;
 	sc->answered = 0;
+	sc->answer_len = 0;
 	return (0);
 }
 
@@ -460,11 +467,31 @@ npugiu_drain(struct npugiu_softc *sc)
 			 */
 			sc->late++;
 		} else if (sc->waiting && tag == sc->wait_tag) {
-			memcpy(sc->answer, d + AGNIC_CMD_DATA, sizeof(sc->answer));
-			sc->answered = 1;
-			sc->waiting = 0;
-			sc->answers++;
-			wakeup(&sc->answered);
+			int pos = (d[AGNIC_CMD_FLAGS] >> AGNIC_CMD_F_BUF_POS_SHIFT) &
+			    AGNIC_CMD_F_BUF_POS_MASK;
+
+			if (sc->answer_len + AGNIC_MGMT_DESC_DATA_LEN <= (int)sizeof(sc->answer)) {
+				memcpy(sc->answer + sc->answer_len, d + AGNIC_CMD_DATA,
+				    AGNIC_MGMT_DESC_DATA_LEN);
+				sc->answer_len += AGNIC_MGMT_DESC_DATA_LEN;
+			} else {
+				sc->overruns++;
+			}
+
+			/*
+			 * Only SINGLE and LAST end a run. Treating every descriptor as a complete
+			 * answer is what made a two-part response look like one answer plus one
+			 * late duplicate - the first version of this counted exactly one spurious
+			 * late arrival per command, which is what led here.
+			 */
+			if (pos == AGNIC_BUF_POS_SINGLE || pos == AGNIC_BUF_POS_LAST) {
+				sc->answered = 1;
+				sc->waiting = 0;
+				sc->answers++;
+				if (pos == AGNIC_BUF_POS_LAST)
+					sc->multipart++;
+				wakeup(&sc->answered);
+			}
 		} else {
 			/* A tag we are not waiting on. Consume it; never index anything with it. */
 			sc->drops++;
@@ -920,9 +947,10 @@ npugiu_detach(void)
 	}
 
 	device_printf(sc->fac.dev,
-	    "giu: %ju commands, %ju answers (%ju late), %ju notifications (%ju keep-alive), "
-	    "%ju unmatched\n",
-	    (uintmax_t)sc->commands, (uintmax_t)sc->answers, (uintmax_t)sc->late,
+	    "giu: %ju commands, %ju answers (%ju multi-part, %ju late, %ju overrun), "
+	    "%ju notifications (%ju keep-alive), %ju unmatched\n",
+	    (uintmax_t)sc->commands, (uintmax_t)sc->answers, (uintmax_t)sc->multipart,
+	    (uintmax_t)sc->late, (uintmax_t)sc->overruns,
 	    (uintmax_t)sc->notifications, (uintmax_t)sc->keepalives, (uintmax_t)sc->drops);
 
 	mtx_destroy(&sc->mtx);
