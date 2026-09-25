@@ -112,6 +112,65 @@ struct npuep_facility {
 struct npuep_softc;
 int	npuep_ring_dbell(struct npuep_softc *sc, int n);
 
+/*
+ * ---------------------------------------------------------------------------------------
+ * The control-message channel's state block, at the start of its window.
+ *
+ * These are not inferred. Sophos ships usfp_rh.ko built with -g3, so the compiler recorded every
+ * field name and offset, and `readelf --debug-dump=info` reads them straight back out. The
+ * constants come from --debug-dump=macro on the same file.
+ *
+ *	struct rpc_state {			struct rpc_ring {
+ *		u32 cfg_magic;			    u64 posted;
+ *		u16 cfg_revision;		    u64 done;
+ *		u8  active_hi_rings;		    u32 ring_offset;
+ *		u8  reconfig_done;		    u32 desc_offset;
+ *		u64 zero_pad[8];		    u32 desc_count;
+ *		struct rpc_ring ring_lo;	    union ring_hw_cfg r_cfg;
+ *		struct rpc_ring rings[];	};
+ *	};
+ *
+ * The three fields the target actually touches on each pass are confirmed twice over: the
+ * disassembly of Marvell's sample handler reads its ring at +0x00 and +0x08 and takes a window
+ * offset from +0x14, which is exactly posted, done and desc_offset.
+ * ---------------------------------------------------------------------------------------
+ */
+#define	RPC_ST_CFG_MAGIC	0x00	/* u32 - the HOST writes this to open the channel */
+#define	  RPC_STATE_CFG_MAGIC	0xD7D3AB00U
+#define	RPC_ST_CFG_REVISION	0x04	/* u16 - the target publishes 1 */
+#define	RPC_ST_ACTIVE_HI_RINGS	0x06	/* u8  */
+#define	RPC_ST_RECONFIG_DONE	0x07	/* u8  */
+#define	RPC_ST_RING_LO		0x48	/* the low-priority ring */
+#define	RPC_ST_RINGS		0x68	/* and the high-priority ones */
+#define	RPC_STATE_SIZE		232
+
+#define	RPC_RING_POSTED		0x00	/* u64 */
+#define	RPC_RING_DONE		0x08	/* u64 */
+#define	RPC_RING_OFFSET		0x10	/* u32 */
+#define	RPC_RING_DESC_OFFSET	0x14	/* u32 */
+#define	RPC_RING_DESC_COUNT	0x18	/* u32 */
+#define	RPC_RING_CFG		0x1c	/* u8 ring_num, u8 f_index, u8 dbell, u8 shared */
+#define	RPC_RING_SIZE		32
+
+#define	RPC_LO_RINGS_MAX	1
+#define	RPC_HI_RINGS_MAX	4
+
+/* A command, in host memory, pointed at by a descriptor in the window. */
+#define	RPC_CMD_RESP_BUFF_SZ	0x00	/* u16 */
+#define	RPC_CMD_CMD		0x03	/* u8 - an index into a 255-entry handler table */
+#define	RPC_CMD_PAYLOAD		0x08
+/* The descriptor itself, sixteen bytes, in the window. */
+#define	RPC_BD_DMA_ADDR		0x00	/* u64 - a HOST physical address */
+#define	RPC_BD_PAYLOAD_LEN	0x08	/* u16 */
+#define	RPC_BD_FLAGS		0x0a	/* u16 */
+#define	  RPC_DESC_POST_FLAG	1
+#define	  RPC_DESC_NO_AGG_DMA	2
+
+/* The commands worth naming, of the forty-five the channel defines. */
+#define	RPC_CMD_LIF_ADD_UPDATE	3	/* make a logical interface */
+#define	RPC_CMD_LIF_DELETE	4
+#define	RPC_CMD_PPORT_UPDATE	5	/* bind a port tag to one: u8 iface, u8 rsvd, u16 tag */
+
 int	npumgmt_attach(struct npuep_facility *fac);
 void	npumgmt_detach(void);
 
