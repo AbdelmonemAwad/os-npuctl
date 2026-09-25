@@ -153,8 +153,13 @@ struct npuep_softc {
 	bus_size_t		 giu_size;
 	bus_size_t		 nwa_off;	/* network agent facility, absolute in BAR0 */
 	bus_size_t		 nwa_size;
+	struct resource		*bar4;		/* the target's register window */
+	int			 bar4_rid;
+
 	bus_size_t		 rpc_off;	/* the control-message channel, in the BAR2 window */
 	bus_size_t		 rpc_size;
+	uint64_t		 dbells_rung;
+
 	uint32_t		 rpc_dump_off;	/* what the reader is looking at */
 	int			 rpc_dump_words;
 
@@ -499,6 +504,74 @@ npuep_setup_dbells(struct npuep_softc *sc)
 }
 
 /*
+ * Ring one of the target's doorbells.
+ *
+ * The write itself is trivial; everything difficult about it is knowing where. The address the
+ * target publishes is an OFFSET into BAR4, so this bounds it against that resource before
+ * writing - an out-of-range offset would otherwise be an MMIO write somewhere unrelated on the
+ * endpoint.
+ *
+ * Ringing with nothing posted is harmless: the target looks at its ring, finds producer and
+ * consumer equal, and goes back to sleep. That is what makes this safe to try on its own, before
+ * there is anything to announce.
+ */
+int
+npuep_ring_dbell(struct npuep_softc *sc, int n)
+{
+	bus_size_t at;
+	uint64_t off;
+	uint32_t cnt, data;
+
+	if (sc->bar4 == NULL)
+		return (ENXIO);
+
+	cnt = bar2_read(sc, sc->window + CTRL_H2T_DBELL_CNT);
+	if (n < 0 || cnt > CTRL_DBELL_MAX || (uint32_t)n >= cnt)
+		return (EINVAL);
+
+	at = sc->window + CTRL_H2T_DBELL_MSG + n * CTRL_DBELL_MSG_SIZE;
+	off = (uint64_t)bar2_read(sc, at + CTRL_DBELL_ADDR) |
+	    ((uint64_t)bar2_read(sc, at + CTRL_DBELL_ADDR + 4) << 32);
+	data = bar2_read(sc, at + CTRL_DBELL_DATA);
+
+	if (off == 0)
+		return (ENXIO);		/* the target has not armed this one */
+	if ((off & 3) != 0 || off > (uint64_t)rman_get_size(sc->bar4) - sizeof(uint32_t)) {
+		device_printf(sc->dev,
+		    "doorbell %d offset %#jx does not fit BAR4 - refusing to write\n",
+		    n, (uintmax_t)off);
+		return (ERANGE);
+	}
+
+	/*
+	 * Whatever the doorbell announces must be visible to the far side before the doorbell is.
+	 * The barrier is against the windows this driver writes, not against BAR4 itself.
+	 */
+	bus_barrier(sc->bar2, 0, rman_get_size(sc->bar2), BUS_SPACE_BARRIER_WRITE);
+	bus_write_4(sc->bar4, (bus_size_t)off, data);
+	sc->dbells_rung++;
+	return (0);
+}
+
+static int
+npuep_sysctl_ring(SYSCTL_HANDLER_ARGS)
+{
+	struct npuep_softc *sc = arg1;
+	int which = -1, err;
+
+	err = sysctl_handle_int(oidp, &which, 0, req);
+	if (err != 0 || req->newptr == NULL)
+		return (err);
+
+	err = npuep_ring_dbell(sc, which);
+	device_printf(sc->dev, "doorbell %d: %s\n", which,
+	    err == 0 ? "rung" :
+	    err == ENXIO ? "not armed, or BAR4 is not mapped" :
+	    err == EINVAL ? "no such doorbell" : "refused");
+	return (err);
+}
+
+/*
  * What the target published about its doorbells.
  *
  * Read-only, and it exists because the control-message channel cannot be driven without it: that
@@ -641,6 +714,11 @@ npuep_add_sysctls(struct npuep_softc *sc)
 	SYSCTL_ADD_U64(ctx, child, OID_AUTO, "handshake", CTLFLAG_RD,
 	    &sc->last_handshake, 0, "handshake word as last read by the heartbeat");
 
+	SYSCTL_ADD_U64(ctx, child, OID_AUTO, "doorbells_rung", CTLFLAG_RD, &sc->dbells_rung, 0,
+	    "host-to-target doorbells this driver has rung");
+	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "ring",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0, npuep_sysctl_ring, "I",
+	    "write a doorbell number to ring it; harmless with nothing posted");
 	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "doorbells",
 	    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0, npuep_sysctl_dbells, "A",
 	    "the host-to-target doorbells the coprocessor published: where to write, and what");
@@ -705,6 +783,20 @@ npuep_attach(device_t dev)
 		err = ENXIO;
 		goto fail;
 	}
+
+	/*
+	 * BAR4 carries the target's registers, and the only thing in it this driver needs is the
+	 * doorbells. Every facility implemented so far polls, so it has never been mapped before.
+	 * Its absence is not fatal - everything that works today keeps working without it - so a
+	 * failure here is reported and carried past rather than refusing the device.
+	 */
+	sc->bar4_rid = PCIR_BAR(NPUEP_DBELL_BAR);
+	sc->bar4 = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &sc->bar4_rid, RF_ACTIVE);
+	if (sc->bar4 == NULL)
+		device_printf(dev, "cannot map BAR4 - the doorbells will not be reachable\n");
+	else
+		device_printf(dev, "BAR4 mapped, %ju bytes - the doorbells are reachable\n",
+		    (uintmax_t)rman_get_size(sc->bar4));
 
 	sc->bar2_rid = PCIR_BAR(2);
 	sc->bar2 = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &sc->bar2_rid,
@@ -902,6 +994,9 @@ npuep_detach(device_t dev)
 	if (sc->nvec > 0)
 		pci_release_msi(dev);
 
+	if (sc->bar4 != NULL)
+		bus_release_resource(dev, SYS_RES_MEMORY, sc->bar4_rid,
+		    sc->bar4);
 	if (sc->bar2 != NULL)
 		bus_release_resource(dev, SYS_RES_MEMORY, sc->bar2_rid,
 		    sc->bar2);
