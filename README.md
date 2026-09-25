@@ -23,24 +23,35 @@ it is sitting there waiting to be told a host is present.
 
 At that point the coprocessor stops waiting and starts its own dataplane.
 
-## What this does not do yet
+## Where the line is
 
-**It moves packets on the management link, and not on the front ports.** `mvmgmt0` carries
-traffic between the host and the coprocessor over two rings in host memory - verified on the
-hardware, zero loss in both directions - and it is the interface every Sophos diagnostic tool on
-the appliance talks over. It is specified in [docs/mvmgmt.md](docs/mvmgmt.md) and implemented in
-`contrib/npuep/npumgmt.c`.
+**Packets move on the management link. The front ports are configured but do not carry traffic
+yet.**
+
+`mvmgmt0` carries traffic between the host and the coprocessor over two rings in host memory -
+verified on the hardware, zero loss in both directions - and it is the interface every Sophos
+diagnostic tool on the appliance talks over. Specified in [docs/mvmgmt.md](docs/mvmgmt.md),
+implemented in `contrib/npuep/npumgmt.c`.
 
 The fourteen front ports belong to a second, much larger facility: GIU, a full NIC with a command
-channel, traffic classes, buffer pools and offloads. It is specified in
-[docs/giu.md](docs/giu.md) and **not implemented**. How the fourteen ports are told apart on one
-trunk is answered there: a two-byte port identifier in front of every frame. What is not
-published, and would have to be recovered from a binary, is the message set that reads and sets
-each port's link state, speed and MTU.
+channel, traffic classes, buffer pools and offloads. `contrib/npuep/npugiu.c` now opens its
+command channel and configures a datapath - the coprocessor answers `CC_PF_MGMT_ECHO`, accepts
+the whole seven-command bring-up sequence, and has begun sending its periodic keep-alive
+unprompted. Specified in [docs/giu.md](docs/giu.md).
 
-[DESIGN.md](DESIGN.md) says where the line currently is. If you are looking for working front
-ports today, this is not that yet. It is the part underneath them, and it is the part that had to
-exist first.
+What is missing between here and a working port:
+
+- a netdev on the GIU trunk, so those rings actually carry frames;
+- the sixty-six byte header the coprocessor prepends - two bytes of port identifier and
+  sixty-four of metadata - and the fourteen interfaces that sit on top of it;
+- per-port control. Bringing a port up, setting its MTU and reading its link state go through a
+  **different** facility, a polled mailbox that Sophos's NetAgent serves. Its message format has
+  been read off a live system and is written up in
+  [docs/netagent.md](docs/netagent.md); what is not yet solved is how a request is signalled to
+  the far side.
+
+[DESIGN.md](DESIGN.md) breaks that down. If you are looking for working front ports today, this
+is not that yet - but every layer underneath them is in place and answering.
 
 ## Hardware
 

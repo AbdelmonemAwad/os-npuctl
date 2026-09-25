@@ -25,16 +25,26 @@ it over PCIe.
 ## Four stages, and where the line is
 
 ```
- 1  release the NPU from reset            DONE   src/etc/rc.syshook.d/early/01-npuctl
- 2  complete the facility handshake       DONE   contrib/npuep/npuep.c
- 3  the management interface, mvmgmt0     WORKING  contrib/npuep/npumgmt.c
- 4  the GIU datapath and the 14 ports     SPECIFIED, not implemented
+ 1   release the NPU from reset           DONE     src/etc/rc.syshook.d/early/01-npuctl
+ 2   complete the facility handshake      DONE     contrib/npuep/npuep.c
+ 3   the management interface, mvmgmt0    WORKING  contrib/npuep/npumgmt.c
+ 4a  the AGNIC command channel            WORKING  contrib/npuep/npugiu.c
+ 4b  traffic classes, queues, buffers     WORKING  contrib/npuep/npugiu.c
+ 4c  a netdev on the trunk                not started
+ 4d  the 66-byte header, 14 interfaces    not started
+ 4e  per-port control, the nwa mailbox    specified, one question open
 ```
 
-Stages 1 to 3 are in this repository as working code, verified on the hardware: `mvmgmt0` carries
-traffic to and from the coprocessor with no loss in either direction. Stage 4 has a specification
-read out of the vendor source - [docs/giu.md](docs/giu.md) - and no implementation. It is a much
-larger protocol than stage 3, and one question in it is still open.
+Stages 1 to 4b are in this repository as working code, verified on the hardware. `mvmgmt0`
+carries traffic with no loss in either direction; the GIU command channel answers
+`CC_PF_MGMT_ECHO`; the coprocessor accepts the whole seven-command bring-up sequence and has
+begun sending its periodic keep-alive unprompted, which is the first thing it has ever said on
+its own initiative.
+
+What is left is 4c through 4e. The first two are ordinary work against a specification that is
+complete - [docs/giu.md](docs/giu.md). The third is a separate facility with its own protocol,
+read off a live system and written up in [docs/netagent.md](docs/netagent.md), where one question
+remains: how a request is signalled to a far side that has no doorbell.
 
 ### Stage 1 - reset
 

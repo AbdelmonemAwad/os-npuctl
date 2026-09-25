@@ -5,10 +5,32 @@ controller: a command channel, traffic classes, descriptor rings, buffer pools, 
 VLAN filtering and statistics. The vendor calls it **AGNIC**, and its facility is `giu`, at BAR0
 offset 0 with four of the five target-to-host doorbells the endpoint allocates.
 
-Not implemented. This is the specification the implementation will be written against, taken from
-Marvell's GPL `giu_nic` source in the Sophos GPL drop. Every claim below is from that source,
-with the file and line where it is worth checking; where the code and its own comments disagree,
-the code wins and this page says so.
+**The command channel and the datapath configuration are implemented**, in
+`contrib/npuep/npugiu.c`. The coprocessor answers `CC_PF_MGMT_ECHO`, accepts the whole
+seven-command bring-up sequence, and has begun sending its periodic keep-alive unprompted. What
+is not implemented is a netdev on top - see the status table in [DESIGN.md](../DESIGN.md).
+
+This page is the specification that was written against, taken from Marvell's GPL `giu_nic`
+source in the Sophos GPL drop. Every claim is from that source, with the file and line where it
+is worth checking; where the code and its own comments disagree, the code wins and this page says
+so. Where the running hardware has since corrected or added to it, that is marked as measured.
+
+## Measured on the hardware, after the fact
+
+**Every response spans two descriptors.** The second carries the same `cmd_idx` with
+`buf_pos = LAST`. A reader that treats each descriptor bearing the waited-for tag as a complete
+answer drops half the payload of anything longer than the 56 inline bytes - port statistics,
+`CC_GET_CAPABILITIES` - and reports the remainder as a late duplicate. Only `SINGLE` and `LAST`
+end a run.
+
+This was found from a counter that did not add up rather than from a failure: eight commands
+produced eight answers and eight "unmatched" arrivals, exactly one spurious duplicate each.
+Splitting that counter into "late answer to our own tag" and "a tag nobody issued", then handling
+`CMD_FLAGS_BUF_POS`, turned it into `8 multi-part, 0 late, 0 unmatched`.
+
+The live configuration structure also confirms the layout this page predicts, field for field:
+`status` reaching `DEV_READY|HOST_MGMT_READY|DEV_MGMT_READY`, both management rings at 256
+entries, and the index array exactly where `dev_use_size` says.
 
 ## The split is the opposite of pcinet's
 
@@ -328,11 +350,19 @@ struct pport_hw_ops {
 };
 ```
 
-That module is `mv_nwa_host`, Sophos's NetAgent, and it reaches the coprocessor over the AGNIC
-command channel as a `CDT_CUSTOM` client. The transport is published - `giu_custom_mgmt.c` is
-`agnic_register_custom()` and `agnic_send_custom_msg()`, a generic pipe with a callback. The
-message set that rides it is not: `mv_gnic_custom_mgmt.h` is included by that file and is absent
-from the drop, and `mv_nwa_host` is a binary.
+That module is `mv_nwa_host`, Sophos's NetAgent.
+
+An earlier reading of this page said it reaches the coprocessor over the AGNIC command channel as
+a `CDT_CUSTOM` client. **That was wrong, or at best incomplete.** `giu_custom_mgmt.c` does
+provide such a pipe - `agnic_register_custom()` and `agnic_send_custom_msg()` - but the traffic
+that actually brings a port up goes through a *different* facility: `nwa`, at BAR0 + 0x4000, with
+no doorbells in either direction. That was settled by watching the window change while ports were
+toggled on a running system, and by the module's own strings, which are full of `nwa bar_map`,
+`nwa facility initialized` and `cmd_mbox_len`.
+
+The message format is now written up in [netagent.md](netagent.md). What remains unpublished is
+how a request is signalled to a far side that has no doorbell - which `mv_nwa_host` itself will
+answer, since it is an ordinary x86-64 object with its symbols intact.
 
 **This splits the work cleanly.** Fourteen interfaces that carry traffic need only the trunk and
 the two-byte tag, both of which are specified here. Fourteen interfaces whose link state, speed
