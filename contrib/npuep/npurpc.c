@@ -30,6 +30,7 @@
 #include <sys/module.h>
 #include <sys/mutex.h>
 #include <sys/sysctl.h>
+#include <sys/taskqueue.h>
 #include <sys/systm.h>
 #include <sys/endian.h>
 
@@ -58,6 +59,17 @@
 /* And for one command to be answered. */
 #define	NPURPC_CMD_WAIT		300
 
+/*
+ * What to tell the coprocessor each interface's MTU is. Larger than the host interfaces' 1500 on
+ * purpose: this number only ever gates a drop - the fastpath discards anything longer - so the
+ * cost of it being too small is silent loss, and the cost of it being large is nothing.
+ */
+#define	NPURPC_LIF_MTU		9000
+
+/* How often to look again, and for how long, while the coprocessor is still starting up. */
+#define	NPURPC_PROG_RETRY	2	/* seconds */
+#define	NPURPC_PROG_TRIES	45	/* so ninety seconds in all */
+
 struct npurpc_softc {
 	struct npuep_facility	 fac;
 	struct mtx		 mtx;
@@ -74,6 +86,19 @@ struct npurpc_softc {
 
 	int			 opened;	/* the magic has been written and taken */
 	int			 stalled;	/* a command went unanswered; post no more */
+
+	/*
+	 * Programming the front ports runs on its own thread, not a callout: every pass sends
+	 * commands and every command waits for an answer, and a callout may not sleep. This
+	 * driver has already taken that panic once, in the network agent.
+	 */
+	struct taskqueue	*tq;
+	struct timeout_task	 task;
+	int			 stop;
+	int			 tries;
+	int			 verified;	/* how many ports read back correct */
+	int			 wiped;		/* said once, when the table is cleared under us */
+	int			 announced;	/* success is worth saying on the edge, not every pass */
 
 	/* The last hand-written exchange, kept so a read can report it. */
 	uint8_t			 raw_cmd;
@@ -525,6 +550,174 @@ npurpc_sysctl_probe(SYSCTL_HANDLER_ARGS)
  * is about to send before sending it, so a mistake is visible in the log even if the target never
  * answers.
  */
+/*
+ * Tell the coprocessor about every front port.
+ *
+ * Two commands each and nothing else - there is no enable bit, no start command and no queue
+ * index anywhere in either of them. A logical interface says what an interface is; binding a port
+ * tag to it says which wire reaches it. Until both exist the fastpath has nothing to look up and
+ * every received frame is dropped before it is even counted, which is what an empty table looks
+ * like from the host: no traffic and no drops.
+ *
+ * OFFLOAD_DISABLED is the field that matters. The fastpath's chain ends "offload_disabled == 1 ->
+ * host", so setting it hands every frame to this end rather than letting the coprocessor route,
+ * which is the whole point of running the firewall here. L2 forwarding mode is chosen for the
+ * same reason and one more: the destination-MAC check only runs in L3 mode, so in L2 the address
+ * below never gates anything.
+ */
+/*
+ * Program every front port, then read every one back, and believe only the read.
+ *
+ * Returns the number of ports that verified.
+ *
+ * The read-back is not belt and braces, it is the protocol. The coprocessor's own userspace
+ * fastpath starts in response to THIS host's handshake, and as part of its startup it zeroes the
+ * whole logical-interface table - about thirteen seconds after the handshake on this board. This
+ * driver opens the control channel a fraction of a second after that same handshake, so the first
+ * pass writes into a table that is about to be cleared. Every command is accepted and answered
+ * with rc 0, and nothing survives; the counters said "14 of 14 made" over an empty table for an
+ * hour before this was understood.
+ *
+ * The port bindings do survive, because the fastpath only maps those two tables and clears
+ * neither. That asymmetry is worth remembering: pport state is not evidence that the interfaces
+ * are still there.
+ *
+ * Read before writing, because creating is not idempotent: update_mask 0x00FF on an entry that is
+ * still valid is refused with rc 1. Creating over a CLEARED entry is fine - the target notes that
+ * the identifier was already allocated, zeroes the entry and fills it in anyway.
+ */
+static int
+npurpc_program_front_ports(struct npurpc_softc *sc)
+{
+	uint8_t pl[RPC_LIF_REQ_SIZE], mac[6], back[12];
+	int i, rc, n, verified = 0;
+
+	mtx_assert(&sc->mtx, MA_OWNED);
+
+	if (!sc->opened || sc->stalled)
+		return (0);
+	if (npugiu_front_mac(0, mac) != 0)
+		return (0);
+
+	for (i = 0; i < NPUEP_NFRONT; i++) {
+		const struct npuep_front_port *fp = &npuep_front_ports[i];
+		uint32_t idx = (uint32_t)fp->iface_id << RPC_LIF_IFACE_SHIFT;
+		int pass;
+
+		if (npugiu_front_mac(i, mac) != 0)
+			continue;
+
+		for (pass = 0; pass < 2; pass++) {
+			memset(pl, 0, RPC_TBL_REQ_SIZE);
+			le32enc(pl + RPC_TBL_S_INDEX, idx);
+			le16enc(pl + RPC_TBL_NUM_ENTRIES, 1);
+			memset(back, 0, sizeof(back));
+			rc = 0;
+			n = npurpc_command(sc, RPC_CMD_LO_LIF_READ, pl, RPC_TBL_REQ_SIZE,
+			    back, sizeof(back), &rc);
+
+			if (n == (int)sizeof(back) && rc == 0 &&
+			    memcmp(back, mac, sizeof(mac)) == 0 &&
+			    le16dec(back + 8) == (RPC_LIF_FWD_L2 | RPC_LIF_OFFLOAD_DISABLED)) {
+				verified++;
+				break;
+			}
+			if (pass != 0)
+				break;		/* written and still not there; next round */
+
+			if (sc->verified == NPUEP_NFRONT && !sc->wiped) {
+				device_printf(sc->fac.dev,
+				    "rpc: the coprocessor's fastpath cleared the interface table "
+				    "during its own startup - programming it again\n");
+				sc->wiped = 1;
+			}
+
+			memset(pl, 0, sizeof(pl));
+			le32enc(pl + RPC_LIF_INDEX, idx);
+			memcpy(pl + RPC_LIF_MAC, mac, sizeof(mac));
+			le16enc(pl + RPC_LIF_MTU, NPURPC_LIF_MTU);
+			le16enc(pl + RPC_LIF_FLAGS, RPC_LIF_FWD_L2 | RPC_LIF_OFFLOAD_DISABLED);
+			le16enc(pl + RPC_LIF_UPDATE_MASK, RPC_LIF_CREATE);
+			rc = 0;
+			if (npurpc_command(sc, RPC_CMD_LIF_ADD_UPDATE, pl, RPC_LIF_REQ_SIZE,
+			    NULL, 0, &rc) < 0)
+				break;
+
+			/*
+			 * And the binding. It survives a table wipe, so this is usually a no-op -
+			 * but there is no command to read one back, so the only way to be sure is
+			 * to write it.
+			 */
+			memset(pl, 0, RPC_PPORT_REQ_SIZE);
+			pl[RPC_PPORT_IFACE] = fp->iface_id;
+			le16enc(pl + RPC_PPORT_TAG, fp->tag);
+			rc = 0;
+			(void)npurpc_command(sc, RPC_CMD_PPORT_UPDATE, pl, RPC_PPORT_REQ_SIZE,
+			    NULL, 0, &rc);
+		}
+	}
+
+	return (verified);
+}
+
+/*
+ * Keep at it until the coprocessor has stopped rearranging its own memory underneath us.
+ *
+ * A fixed delay would be a guess about a boot this host does not control, and the fastpath's
+ * startup varies. Verification is the only thing that is right on a slow boot, a fast one, and a
+ * driver loaded onto a coprocessor that has been up for hours and will never clear anything again.
+ */
+static void
+npurpc_task(void *arg, int pending)
+{
+	struct npurpc_softc *sc = arg;
+	int done, stop, give_up = 0;
+
+	mtx_lock(&sc->mtx);
+	if (sc->stop) {
+		mtx_unlock(&sc->mtx);
+		return;
+	}
+
+	sc->verified = npurpc_program_front_ports(sc);
+	sc->tries++;
+
+	done = (sc->verified == NPUEP_NFRONT);
+	/*
+	 * On the edge, not on every pass. This keeps checking for a minute after it first
+	 * succeeds, because the clearing lands seconds later - and a line every two seconds for a
+	 * minute is how a message worth reading becomes one nobody reads.
+	 */
+	if (done && !sc->announced) {
+		device_printf(sc->fac.dev,
+		    "rpc: all %d front ports have an interface and a binding, read back and "
+		    "confirmed\n", NPUEP_NFRONT);
+		sc->announced = 1;
+	} else if (!done)
+		sc->announced = 0;
+
+	if (!done && sc->tries >= NPURPC_PROG_TRIES) {
+		give_up = 1;
+		device_printf(sc->fac.dev,
+		    "rpc: gave up after %d seconds - only %d of %d front ports read back "
+		    "correctly\n", NPURPC_PROG_TRIES * NPURPC_PROG_RETRY, sc->verified,
+		    NPUEP_NFRONT);
+	}
+
+	/*
+	 * Keep looking for a while even once they are all there. The clearing happens seconds
+	 * after the channel opens, so stopping at the first success would stop just before it.
+	 */
+	if (done && sc->tries >= NPURPC_PROG_TRIES / 2)
+		give_up = 1;
+
+	stop = sc->stop || give_up;
+	mtx_unlock(&sc->mtx);
+
+	if (!stop)
+		taskqueue_enqueue_timeout(sc->tq, &sc->task, hz * NPURPC_PROG_RETRY);
+}
+
 static int
 npurpc_sysctl_command(SYSCTL_HANDLER_ARGS)
 {
@@ -716,6 +909,17 @@ npurpc_attach(struct npuep_facility *fac)
 	err = npurpc_open(sc);
 	RPC_UNLOCK(sc);
 
+	/*
+	 * Not here. Attach runs within a fraction of a second of the handshake that starts the
+	 * coprocessor's own software, and that software clears the table this would be writing.
+	 */
+	if (err == 0) {
+		sc->tq = taskqueue_create("npurpc", M_WAITOK, taskqueue_thread_enqueue, &sc->tq);
+		TIMEOUT_TASK_INIT(sc->tq, &sc->task, 0, npurpc_task, sc);
+		taskqueue_start_threads(&sc->tq, 1, PI_NET, "npurpc");
+		taskqueue_enqueue_timeout(sc->tq, &sc->task, 0);
+	}
+
 	npurpc_add_sysctls(sc);
 
 	/*
@@ -733,6 +937,25 @@ npurpc_detach(void)
 
 	if (sc == NULL)
 		return;
+
+	/*
+	 * Stop the programming thread first, and keep cancelling until there is nothing left to
+	 * cancel. One drain is not enough on its own: a pass that started before the flag was
+	 * published can requeue after the drain returns, and then taskqueue_free waits forever for
+	 * a thread that keeps being handed work. That is a hung, uninterruptible unload, and this
+	 * driver has already produced one.
+	 */
+	RPC_LOCK(sc);
+	sc->stop = 1;
+	RPC_UNLOCK(sc);
+
+	if (sc->tq != NULL) {
+		while (taskqueue_cancel_timeout(sc->tq, &sc->task, NULL) != 0)
+			taskqueue_drain_timeout(sc->tq, &sc->task);
+		taskqueue_drain_timeout(sc->tq, &sc->task);
+		taskqueue_free(sc->tq);
+		sc->tq = NULL;
+	}
 
 	/*
 	 * Withdraw before freeing. The target stops fetching descriptors when the magic is gone,

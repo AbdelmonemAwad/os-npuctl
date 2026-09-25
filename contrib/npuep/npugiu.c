@@ -192,6 +192,20 @@ struct npugiu_ring {
 	uint32_t	 shadow;	/* the index THIS side owns, kept locally */
 };
 
+/*
+ * One host interface per front port.
+ *
+ * The coprocessor multiplexes all fourteen onto a single pair of queues and distinguishes them
+ * only by the two-byte tag in front of each frame, so the split has to happen here: the tag is
+ * written on the way out and read on the way in, and neither direction has anything else to go on.
+ */
+struct npugiu_port {
+	struct npugiu_softc	*sc;		/* every handler arrives holding one of these */
+	if_t			 ifp;
+	const struct npuep_front_port *fp;
+	uint8_t			 mac[6];
+};
+
 struct npugiu_softc {
 	struct npuep_facility	 fac;
 	struct mtx		 mtx;
@@ -227,11 +241,17 @@ struct npugiu_softc {
 	int			 ntxbuf;
 	int			 datapath;	/* the bring-up sequence completed */
 
-	if_t			 ifp;
-	uint32_t		 out_port;	/* NPUGIU_DEFAULT_PORT unless changed */
+	struct npugiu_port	 port[NPUEP_NFRONT];
+	/*
+	 * Tag to port index, so the receive path does not scan. The two families need two maps:
+	 * the switch ports are dense in (tag >> 8) & 0x7f, the SoC ports are dense in tag itself.
+	 */
+	int8_t			 by_hi[NPUGIU_MAX_PORTS];
+	int8_t			 by_lo[8];
 	uint64_t		 rx_packets, rx_bytes, rx_dropped, rx_bad, rx_nobuf;
 	uint64_t		 tx_packets, tx_bytes, tx_full, tx_toolong;
-	uint64_t		 rx_port[NPUGIU_MAX_PORTS];
+	uint64_t		 rx_port[NPUEP_NFRONT];
+	uint64_t		 rx_untagged;	/* a tag that matches no front port */
 	uint64_t		 rx_q[NPUGIU_NUM_QS];	/* which queue a frame arrived on */
 
 	uint16_t		 next_tag;
@@ -636,7 +656,7 @@ npugiu_drain(struct npugiu_softc *sc)
  * inside writel(), which is not a guarantee this code can borrow.
  */
 static int
-npugiu_encap(struct npugiu_softc *sc, struct mbuf *m)
+npugiu_encap(struct npugiu_softc *sc, struct mbuf *m, uint16_t tag)
 {
 	/*
 	 * Transmit on queue zero only. Four are registered because that is what the device's
@@ -666,8 +686,8 @@ npugiu_encap(struct npugiu_softc *sc, struct mbuf *m)
 
 	b = sc->txbuf[push].vaddr;
 	/* the port identifier, network order, in front of everything */
-	b[0] = (uint8_t)((sc->out_port >> 8) & 0xFF);
-	b[1] = (uint8_t)(sc->out_port & 0xFF);
+	b[0] = (uint8_t)((tag >> 8) & 0xFF);
+	b[1] = (uint8_t)(tag & 0xFF);
 	/*
 	 * The metadata area. The vendor fills it with a descending ramp where it has nothing to
 	 * put; zeros are the honest equivalent and do not pretend to carry information.
@@ -693,9 +713,10 @@ npugiu_encap(struct npugiu_softc *sc, struct mbuf *m)
 }
 
 static void
-npugiu_start_locked(struct npugiu_softc *sc)
+npugiu_start_locked(struct npugiu_port *pt)
 {
-	if_t ifp = sc->ifp;
+	struct npugiu_softc *sc = pt->sc;
+	if_t ifp = pt->ifp;
 	struct mbuf *m;
 
 	mtx_assert(&sc->mtx, MA_OWNED);
@@ -708,7 +729,7 @@ npugiu_start_locked(struct npugiu_softc *sc)
 		m = if_dequeue(ifp);
 		if (m == NULL)
 			break;
-		if (npugiu_encap(sc, m) != 0) {
+		if (npugiu_encap(sc, m, pt->fp->tag) != 0) {
 			if_sendq_prepend(ifp, m);
 			if_setdrvflagbits(ifp, IFF_DRV_OACTIVE, 0);
 			break;
@@ -722,11 +743,31 @@ npugiu_start_locked(struct npugiu_softc *sc)
 static void
 npugiu_start(if_t ifp)
 {
-	struct npugiu_softc *sc = if_getsoftc(ifp);
+	struct npugiu_port *pt = if_getsoftc(ifp);
 
-	GIU_LOCK(sc);
-	npugiu_start_locked(sc);
-	GIU_UNLOCK(sc);
+	GIU_LOCK(pt->sc);
+	npugiu_start_locked(pt);
+	GIU_UNLOCK(pt->sc);
+}
+
+/*
+ * Which front port a tag belongs to, or -1.
+ *
+ * Two maps rather than a scan, because this runs once per received frame. An identifier that
+ * matches neither is not an error worth a message - it is counted and the frame is still
+ * delivered, because a frame from a port we have no name for is better examined than dropped.
+ */
+static __inline int
+npugiu_port_of_tag(struct npugiu_softc *sc, uint16_t tag)
+{
+	if ((tag & 0x8000) != 0) {
+		int n = (tag >> 8) & 0x7F;
+
+		if (n < NPUGIU_MAX_PORTS)
+			return (sc->by_hi[n]);
+	} else if (tag < 8)
+		return (sc->by_lo[tag]);
+	return (-1);
 }
 
 /*
@@ -781,7 +822,6 @@ npugiu_rx_queue(struct npugiu_softc *sc, int q, int budget, struct mbuf **head,
     struct mbuf **tail)
 {
 	struct npugiu_ring *r = &sc->rx[q];
-	if_t ifp = sc->ifp;
 	uint32_t prod;
 	int done = 0;
 
@@ -835,15 +875,39 @@ npugiu_rx_queue(struct npugiu_softc *sc, int q, int budget, struct mbuf **head,
 		port = ((uint16_t)src[0] << 8) | src[1];
 		len = total - NPUGIU_HDR_LEN;
 
-		m = m_getcl(M_NOWAIT, MT_DATA, M_PKTHDR);
+		/*
+		 * Sized for the frame, not for a fixed cluster. m_getcl always returns 2048 bytes,
+		 * and the length check above only bounds the copy by the DMA buffer - which the
+		 * device is free to report as up to sixteen kilobytes, and which the interface
+		 * table now declares an MTU of 9000 for. A frame between those two numbers was a
+		 * memcpy straight off the end of a UMA item.
+		 */
+		m = m_get2(len, M_NOWAIT, MT_DATA, M_PKTHDR);
 		if (m == NULL) {
+			/*
+			 * Leave the descriptor and its buffer exactly as they are.
+			 *
+			 * Returning the buffer here and then breaking - which is what this did -
+			 * hands it back to the device WITHOUT consuming the descriptor: the cookie
+			 * is not stamped, the shadow index does not advance and the consumer index
+			 * is never published. The next pass reads the same slot, copies out of
+			 * memory the device now owns, delivers that as a frame, and returns the same
+			 * buffer a second time. One buffer, two owners, and it compounds from there.
+			 *
+			 * Doing nothing is correct: the descriptor still owns its buffer, and the
+			 * next tick retries the frame intact.
+			 */
 			sc->rx_nobuf++;
-			npugiu_bpool_return(sc, bufidx);
 			break;
 		}
 		memcpy(mtod(m, void *), src + NPUGIU_HDR_LEN, len);
 		m->m_pkthdr.len = m->m_len = len;
-		m->m_pkthdr.rcvif = ifp;
+		/*
+		 * The tag is the only thing that says which front port this arrived on, and so the
+		 * only thing that can say which host interface it belongs to.
+		 */
+		n = npugiu_port_of_tag(sc, port);
+		m->m_pkthdr.rcvif = (n >= 0) ? sc->port[n].ifp : NULL;
 		m->m_nextpkt = NULL;
 
 		if (*head == NULL)
@@ -854,12 +918,13 @@ npugiu_rx_queue(struct npugiu_softc *sc, int q, int budget, struct mbuf **head,
 
 		sc->rx_packets++;
 		sc->rx_bytes += len;
-		n = NPUGIU_PORT_NUM(port);
-		if (n < NPUGIU_MAX_PORTS)
+		if (n >= 0) {
 			sc->rx_port[n]++;
+			if (sc->port[n].ifp != NULL)
+				if_inc_counter(sc->port[n].ifp, IFCOUNTER_IPACKETS, 1);
+		} else
+			sc->rx_untagged++;
 		sc->rx_q[q]++;
-		if (ifp != NULL)
-			if_inc_counter(ifp, IFCOUNTER_IPACKETS, 1);
 
 		/* Stamp the slot back before releasing it, so the next round can tell. */
 		le64enc(d + AGNIC_RXD_COOKIE, AGNIC_COOKIE_DRIVER_WATERMARK);
@@ -889,17 +954,17 @@ npugiu_rx(struct npugiu_softc *sc, int budget, struct mbuf **head, struct mbuf *
 }
 
 static void
-npugiu_init_locked(struct npugiu_softc *sc)
+npugiu_init_locked(struct npugiu_port *pt)
 {
-	mtx_assert(&sc->mtx, MA_OWNED);
+	mtx_assert(&pt->sc->mtx, MA_OWNED);
 
-	if (!sc->datapath || sc->ifp == NULL)
+	if (!pt->sc->datapath || pt->ifp == NULL)
 		return;
-	if ((if_getdrvflags(sc->ifp) & IFF_DRV_RUNNING) != 0)
+	if ((if_getdrvflags(pt->ifp) & IFF_DRV_RUNNING) != 0)
 		return;
 
-	if_setdrvflagbits(sc->ifp, IFF_DRV_RUNNING, IFF_DRV_OACTIVE);
-	if_link_state_change(sc->ifp, LINK_STATE_UP);
+	if_setdrvflagbits(pt->ifp, IFF_DRV_RUNNING, IFF_DRV_OACTIVE);
+	if_link_state_change(pt->ifp, LINK_STATE_UP);
 }
 
 /*
@@ -913,31 +978,47 @@ npugiu_init_locked(struct npugiu_softc *sc)
 static void
 npugiu_ifinit(void *xsc)
 {
-	struct npugiu_softc *sc = xsc;
+	struct npugiu_port *pt = xsc;
 
-	GIU_LOCK(sc);
-	npugiu_init_locked(sc);
-	GIU_UNLOCK(sc);
+	GIU_LOCK(pt->sc);
+	npugiu_init_locked(pt);
+	GIU_UNLOCK(pt->sc);
 }
 
 static int
 npugiu_ioctl(if_t ifp, u_long cmd, caddr_t data)
 {
-	struct npugiu_softc *sc = if_getsoftc(ifp);
+	struct npugiu_port *pt = if_getsoftc(ifp);
 	struct ifreq *ifr = (struct ifreq *)data;
 	int err = 0;
 
 	switch (cmd) {
 	case SIOCSIFFLAGS:
-		GIU_LOCK(sc);
+		GIU_LOCK(pt->sc);
 		if ((if_getflags(ifp) & IFF_UP) != 0)
-			npugiu_init_locked(sc);
-		GIU_UNLOCK(sc);
+			npugiu_init_locked(pt);
+		GIU_UNLOCK(pt->sc);
 		break;
 	case SIOCSIFMTU:
-		/* The buffers were sized once, for this MTU plus the sixty-six byte header. */
-		if (ifr->ifr_mtu != NPUGIU_MTU)
+		/*
+		 * Anything the device's own buffers can hold.
+		 *
+		 * This used to refuse every value but 1500, on the grounds that the buffers were
+		 * sized for it. They were not: they are sized at attach from what the device
+		 * reported in GET_CAPABILITIES - 9304 bytes on this board - and both directions
+		 * are already bounded by that rather than by this number. The receive path sizes
+		 * each mbuf to the frame, and the transmit path refuses anything longer than a
+		 * buffer. The interface table was programmed with an MTU of 9000 as well, so the
+		 * coprocessor will not drop a jumbo frame on the way in either.
+		 *
+		 * So the only thing the old check bought was a jumbo frame arriving on a wire this
+		 * end had declined to accept.
+		 */
+		if (ifr->ifr_mtu < ETHERMIN ||
+		    ifr->ifr_mtu > pt->sc->buf_size - NPUGIU_HDR_LEN)
 			err = EINVAL;
+		else
+			if_setmtu(ifp, ifr->ifr_mtu);
 		break;
 	case SIOCADDMULTI:
 	case SIOCDELMULTI:
@@ -950,22 +1031,80 @@ npugiu_ioctl(if_t ifp, u_long cmd, caddr_t data)
 	return (err);
 }
 
+/*
+ * One interface per front port, named for the number on the chassis.
+ *
+ * The addresses are this host's to choose - the coprocessor does not filter on them, because the
+ * interfaces are configured in L2 mode where the destination-MAC check does not run - so they are
+ * derived from the address the datapath already answers to, one per unit. Locally administered,
+ * distinct, and stable across loads, which is what an operator assigning these in a firewall
+ * needs more than it needs them to match the labels on the silicon.
+ */
 static int
 npugiu_attach_ifnet(struct npugiu_softc *sc)
 {
+	int i;
 
-	sc->ifp = if_alloc(IFT_ETHER);
-	if_setsoftc(sc->ifp, sc);
-	if_initname(sc->ifp, "npugiu", 0);
-	if_setflags(sc->ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST);
-	if_setinitfn(sc->ifp, npugiu_ifinit);
-	if_setstartfn(sc->ifp, npugiu_start);
-	if_setioctlfn(sc->ifp, npugiu_ioctl);
-	if_setsendqlen(sc->ifp, NPUGIU_DATA_Q_LEN - 1);
-	if_setsendqready(sc->ifp);
-	if_setmtu(sc->ifp, NPUGIU_MTU);
+	/*
+	 * Called WITHOUT the datapath mutex, and it must stay that way. ether_ifattach allocates,
+	 * takes the global interface lock and calls into the stack, all of which can sleep - and
+	 * this driver has already panicked once on sleeping under this very mutex.
+	 *
+	 * So each interface is built and attached unlocked, then published under a short lock.
+	 * Between the two the port is invisible rather than half-visible: the tag maps still say
+	 * "no port", and both the poller and the receive path skip an entry whose ifp is NULL.
+	 */
+	for (i = 0; i < NPUEP_NFRONT; i++) {
+		struct npugiu_port *pt = &sc->port[i];
+		const struct npuep_front_port *fp = &npuep_front_ports[i];
+		if_t ifp;
 
-	ether_ifattach(sc->ifp, sc->hostmac);
+		pt->sc = sc;
+		pt->fp = fp;
+		memcpy(pt->mac, sc->hostmac, sizeof(pt->mac));
+		pt->mac[5] = (uint8_t)(sc->hostmac[5] + fp->unit);
+
+		ifp = if_alloc(IFT_ETHER);
+		if (ifp == NULL)
+			return (ENOMEM);
+
+		if_setsoftc(ifp, pt);
+		if_initname(ifp, "npup", fp->unit);
+		if_setflags(ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST);
+		if_setinitfn(ifp, npugiu_ifinit);
+		if_setstartfn(ifp, npugiu_start);
+		if_setioctlfn(ifp, npugiu_ioctl);
+		if_setsendqlen(ifp, NPUGIU_DATA_Q_LEN - 1);
+		if_setsendqready(ifp);
+		if_setmtu(ifp, NPUGIU_MTU);
+		ether_ifattach(ifp, pt->mac);
+
+		GIU_LOCK(sc);
+		pt->ifp = ifp;
+		if ((fp->tag & 0x8000) != 0)
+			sc->by_hi[(fp->tag >> 8) & 0x7F] = (int8_t)i;
+		else if (fp->tag < 8)
+			sc->by_lo[fp->tag] = (int8_t)i;
+		GIU_UNLOCK(sc);
+	}
+	return (0);
+}
+
+/*
+ * The address this driver gave one front port's interface.
+ *
+ * The control channel has to tell the coprocessor the same address, and it attaches after this
+ * facility does, so by the time it asks these exist. If the datapath never came up there is
+ * nothing to tell anyone about, and saying so is better than inventing an address.
+ */
+int
+npugiu_front_mac(int idx, uint8_t *out)
+{
+	struct npugiu_softc *sc = npugiu_sc;
+
+	if (sc == NULL || idx < 0 || idx >= NPUEP_NFRONT || sc->port[idx].ifp == NULL)
+		return (ENXIO);
+	memcpy(out, sc->port[idx].mac, 6);
 	return (0);
 }
 
@@ -974,7 +1113,7 @@ npugiu_tick(void *arg)
 {
 	struct npugiu_softc *sc = arg;
 	struct mbuf *head = NULL, *tail = NULL;
-	if_t ifp;
+	int i;
 
 	mtx_assert(&sc->mtx, MA_OWNED);
 	if (!sc->running)
@@ -984,9 +1123,11 @@ npugiu_tick(void *arg)
 
 	if (sc->datapath) {
 		(void)npugiu_rx(sc, 64, &head, &tail);
-		if (sc->ifp != NULL) {
-			if_setdrvflagbits(sc->ifp, 0, IFF_DRV_OACTIVE);
-			npugiu_start_locked(sc);
+		for (i = 0; i < NPUEP_NFRONT; i++) {
+			if (sc->port[i].ifp == NULL)
+				continue;
+			if_setdrvflagbits(sc->port[i].ifp, 0, IFF_DRV_OACTIVE);
+			npugiu_start_locked(&sc->port[i]);
 		}
 	}
 
@@ -1000,15 +1141,20 @@ npugiu_tick(void *arg)
 	 * callout_init_mtx requires.
 	 */
 	if (head != NULL) {
-		ifp = sc->ifp;
 		GIU_UNLOCK(sc);
 		while (head != NULL) {
 			struct mbuf *m = head;
+			if_t rcv = m->m_pkthdr.rcvif;
 
 			head = m->m_nextpkt;
 			m->m_nextpkt = NULL;
-			if (ifp != NULL)
-				if_input(ifp, m);
+			/*
+			 * Each frame goes up on the interface its own tag named, not on a single
+			 * one for the whole chain - the chain routinely holds frames from several
+			 * front ports, because the device multiplexes them onto one queue.
+			 */
+			if (rcv != NULL)
+				if_input(rcv, m);
 			else
 				m_freem(m);
 		}
@@ -1626,8 +1772,8 @@ npugiu_add_sysctls(struct npugiu_softc *sc)
 		return;
 	child = SYSCTL_CHILDREN(node);
 
-	SYSCTL_ADD_U32(ctx, child, OID_AUTO, "out_port", CTLFLAG_RW, &sc->out_port, 0,
-	    "port identifier written in front of every transmitted frame");
+	SYSCTL_ADD_U64(ctx, child, OID_AUTO, "rx_untagged", CTLFLAG_RD, &sc->rx_untagged, 0,
+	    "frames whose port identifier matched no front port");
 	SYSCTL_ADD_INT(ctx, child, OID_AUTO, "pkt_offset", CTLFLAG_RD, &npugiu_pkt_offset, 0,
 	    "offset the ingress class was asked to place frames at");
 	SYSCTL_ADD_INT(ctx, child, OID_AUTO, "buf_size", CTLFLAG_RD, &sc->buf_size, 0,
@@ -1687,13 +1833,9 @@ npugiu_add_sysctls(struct npugiu_softc *sc)
 	if (node == NULL)
 		return;
 	child = SYSCTL_CHILDREN(node);
-	for (i = 0; i < NPUGIU_MAX_PORTS; i++) {
-		char name[8];
-
-		snprintf(name, sizeof(name), "%d", i);
-		SYSCTL_ADD_U64(ctx, child, OID_AUTO, name, CTLFLAG_RD, &sc->rx_port[i], 0,
-		    "frames received on this port");
-	}
+	for (i = 0; i < NPUEP_NFRONT; i++)
+		SYSCTL_ADD_U64(ctx, child, OID_AUTO, npuep_front_ports[i].label, CTLFLAG_RD,
+		    &sc->rx_port[i], 0, "frames received on this front port");
 }
 
 int
@@ -1712,6 +1854,15 @@ npugiu_attach(struct npuep_facility *fac)
 
 	sc = malloc(sizeof(*sc), M_DEVBUF, M_WAITOK | M_ZERO);
 	sc->fac = *fac;
+	/*
+	 * Before anything can poll. M_ZERO leaves these zero, and zero is a valid port index, so
+	 * a frame arriving before the interfaces exist would be delivered to whichever one index
+	 * zero happens to name. They have to mean "no port" from the outset.
+	 */
+	for (i = 0; i < NPUGIU_MAX_PORTS; i++)
+		sc->by_hi[i] = -1;
+	for (i = 0; i < 8; i++)
+		sc->by_lo[i] = -1;
 	mtx_init(&sc->mtx, "npugiu", NULL, MTX_DEF);
 	callout_init_mtx(&sc->poll, &sc->mtx, 0);
 
@@ -1929,23 +2080,38 @@ npugiu_attach(struct npuep_facility *fac)
 			for (i = 0; i < sc->rx[q].len; i++)
 				le64enc(desc_at(&sc->rx[q], (uint32_t)i) + AGNIC_RXD_COOKIE,
 				    AGNIC_COOKIE_DRIVER_WATERMARK);
-		sc->out_port = NPUGIU_DEFAULT_PORT;
 		err = npugiu_bringup(sc);
 	}
+	GIU_UNLOCK(sc);
+
 	if (err == 0)
 		err = npugiu_attach_ifnet(sc);
-	GIU_UNLOCK(sc);
 
 	if (err != 0)
 		device_printf(fac->dev,
 		    "giu: the datapath did not come up (%d) - the command channel is still "
 		    "running\n", err);
 	else {
+		int k;
+
 		npugiu_add_sysctls(sc);
 		device_printf(fac->dev,
-		    "giu: datapath enabled - %s, %d descriptors each way, frames tagged for "
-		    "port 0x%04x\n", sc->ifp != NULL ? if_name(sc->ifp) : "no interface",
-		    NPUGIU_DATA_Q_LEN, sc->out_port);
+		    "giu: datapath enabled - %d interfaces, %d descriptors each way\n",
+		    NPUEP_NFRONT, NPUGIU_DATA_Q_LEN);
+		for (k = 0; k < NPUEP_NFRONT; k += 2) {
+			if (k + 1 < NPUEP_NFRONT)
+				device_printf(fac->dev,
+				    "giu:   %-7s %s tag 0x%04x      %-7s %s tag 0x%04x\n",
+				    npuep_front_ports[k].label,
+				    if_name(sc->port[k].ifp), npuep_front_ports[k].tag,
+				    npuep_front_ports[k + 1].label,
+				    if_name(sc->port[k + 1].ifp),
+				    npuep_front_ports[k + 1].tag);
+			else
+				device_printf(fac->dev, "giu:   %-7s %s tag 0x%04x\n",
+				    npuep_front_ports[k].label,
+				    if_name(sc->port[k].ifp), npuep_front_ports[k].tag);
+		}
 	}
 
 	return (0);
@@ -2019,10 +2185,12 @@ npugiu_detach(void)
 	 * Detach the interface before anything it points at is freed. Nothing can be queued to it
 	 * afterwards, which is what makes the rest of this safe.
 	 */
-	if (sc->ifp != NULL) {
-		ether_ifdetach(sc->ifp);
-		if_free(sc->ifp);
-		sc->ifp = NULL;
+	for (q = 0; q < NPUEP_NFRONT; q++) {
+		if (sc->port[q].ifp == NULL)
+			continue;
+		ether_ifdetach(sc->port[q].ifp);
+		if_free(sc->port[q].ifp);
+		sc->port[q].ifp = NULL;
 	}
 
 	/*

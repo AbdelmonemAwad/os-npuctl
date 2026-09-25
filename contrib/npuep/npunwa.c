@@ -131,7 +131,7 @@ struct npunwa_softc {
 	int			 dump_words;
 	uint32_t		 body;		/* NWA_BODY_OFF's value, also the gate */
 	uint32_t		 max_req;
-	struct npunwa_port	 port[NWA_LAST_PORT + 1];
+	struct npunwa_port	 port[NPUEP_NFRONT];
 	uint64_t		 commands, failures, timeouts;
 };
 
@@ -346,14 +346,14 @@ npunwa_command(struct npunwa_softc *sc, uint32_t op, uint32_t sub, uint32_t port
 static int
 npunwa_port_set_state(struct npunwa_softc *sc, int n, int up)
 {
-	return (npunwa_command(sc, NWA_OP_SET, NWA_SUB_STATE, NWA_PORT_ID(n),
+	return (npunwa_command(sc, NWA_OP_SET, NWA_SUB_STATE, npuep_front_ports[n].tag,
 	    up ? 1 : 0, NULL, 0));
 }
 
 static int
 npunwa_port_get(struct npunwa_softc *sc, int n, uint32_t sub, uint32_t *out)
 {
-	return (npunwa_command(sc, NWA_OP_GET, sub, NWA_PORT_ID(n), 0, out, 1));
+	return (npunwa_command(sc, NWA_OP_GET, sub, npuep_front_ports[n].tag, 0, out, 1));
 }
 
 /*
@@ -368,15 +368,26 @@ npunwa_bring_up(struct npunwa_softc *sc)
 
 	mtx_assert(&sc->mtx, MA_OWNED);
 
-	for (n = NWA_FIRST_PORT; n <= NWA_LAST_PORT; n++) {
+	/*
+	 * All fourteen, not the ten behind the switch.
+	 *
+	 * The four SoC ports were dark for the life of this driver because nothing ever asked for
+	 * them: the identifier used to be computed as 0x8000 + n * 0x100, which cannot express the
+	 * 0x0001 to 0x0004 they actually answer to. The agent knows them perfectly well - asked for
+	 * their addresses it returns the same ones the vendor's kernel prints - so the only thing
+	 * that was ever missing was the request. This loop is also what lights them: a port comes up
+	 * because it is commanded up, and nothing else here does that.
+	 */
+	for (n = 0; n < NPUEP_NFRONT; n++) {
 		struct npunwa_port *p = &sc->port[n];
 
-		p->id = NWA_PORT_ID(n);
+		p->id = npuep_front_ports[n].tag;
 		p->link = -1;		/* unknown, so the first sweep always reports */
 		p->media = -1;
 
 		if (npunwa_port_set_state(sc, n, 1) != 0) {
-			device_printf(sc->fac.dev, "nwa: port %d refused to come up\n", n);
+			device_printf(sc->fac.dev, "nwa: %s refused to come up\n",
+			    npuep_front_ports[n].label);
 			continue;
 		}
 		p->up = 1;
@@ -398,7 +409,7 @@ npunwa_bring_up(struct npunwa_softc *sc)
 	 * what is actually connected, a moment later.
 	 */
 	device_printf(sc->fac.dev, "nwa: %d of %d ports up\n",
-	    up, NWA_LAST_PORT - NWA_FIRST_PORT + 1);
+	    up, NPUEP_NFRONT);
 	(void)linked;
 }
 
@@ -416,22 +427,23 @@ npunwa_link_step(struct npunwa_softc *sc)
 	mtx_assert(&sc->mtx, MA_OWNED);
 
 	n = sc->sweep;
-	if (n < NWA_FIRST_PORT || n > NWA_LAST_PORT)
-		n = NWA_FIRST_PORT;
+	if (n < 0 || n >= NPUEP_NFRONT)
+		n = 0;
 	p = &sc->port[n];
 
 	if (p->up && npunwa_port_get(sc, n, NWA_SUB_STATE, &v) == 0) {
 		int link = (v != 0);
 
 		if (link != p->link) {
-			device_printf(sc->fac.dev, "nwa: port %d (0x%04x, %s) %s\n",
-			    n, p->id, p->media == 3 ? "fibre" : "copper",
+			device_printf(sc->fac.dev, "nwa: %s (0x%04x, %s) %s\n",
+			    npuep_front_ports[n].label, p->id,
+			    p->media == 3 ? "fibre" : "copper",
 			    link ? "carrier up" : "carrier down");
 			p->link = link;
 		}
 	}
 
-	sc->sweep = (n >= NWA_LAST_PORT) ? NWA_FIRST_PORT : n + 1;
+	sc->sweep = (n + 1 >= NPUEP_NFRONT) ? 0 : n + 1;
 	return (NPUNWA_LINK_TICK);
 }
 
@@ -721,7 +733,7 @@ npunwa_ready_step(struct npunwa_softc *sc)
 
 	/* From here the same task is the link poll. */
 	sc->ready = 1;
-	sc->sweep = NWA_FIRST_PORT;
+	sc->sweep = 0;
 	return (NPUNWA_LINK_TICK);
 }
 
@@ -822,7 +834,7 @@ npunwa_detach(void)
 	/* Nothing else can reach the mailbox now, and this context is allowed to sleep. */
 	mtx_lock(&sc->mtx);
 	if (sc->body != 0 && nwa_rd(sc, NWA_COOKIE) == NWA_COOKIE_VALUE) {
-		for (n = NWA_FIRST_PORT; n <= NWA_LAST_PORT; n++)
+		for (n = 0; n < NPUEP_NFRONT; n++)
 			if (sc->port[n].up)
 				(void)npunwa_port_set_state(sc, n, 0);
 	}
