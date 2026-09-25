@@ -19,6 +19,13 @@
  * far side of a PCIe link, and a plain C dereference of it is how the vendor driver does it and
  * is not how FreeBSD should.
  */
+/*
+ * The smallest mvmgmt window that can hold struct pci_net_shared_cfg. A facility smaller than
+ * this cannot be what it claims to be, and the size came from the coprocessor, so it is checked
+ * where the map is read rather than trusted downstream.
+ */
+#define	NPUEP_MGMT_MIN_SIZE	0x28
+
 struct npuep_facility {
 	device_t	 dev;
 	struct resource	*res;		/* the BAR this facility's window is in */

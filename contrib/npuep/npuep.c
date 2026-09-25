@@ -275,8 +275,17 @@ npuep_read_barmap(struct npuep_softc *sc)
 		 * us. Same rule as the control facility: bound it against the window we
 		 * actually mapped, because the offset came from the coprocessor.
 		 */
+		/*
+		 * Order matters here and the obvious spelling is wrong. `size` is unsigned and
+		 * comes from the coprocessor, so `off <= WINDOW_LEN - size` wraps to a huge
+		 * value the moment size exceeds the window - and then every offset passes, and
+		 * npumgmt's bus_write_8 lands outside BAR2 at an address the far side chose.
+		 * Bound size first, then subtract. The control facility below subtracts a
+		 * constant, so it never had this problem.
+		 */
 		if (type == MV_FACILITY_MGMT_NETDEV && bar == 1 &&
-		    size != 0 && off <= NPU_BARMAP_WINDOW_LEN - size) {
+		    size >= NPUEP_MGMT_MIN_SIZE && size <= NPU_BARMAP_WINDOW_LEN &&
+		    off <= NPU_BARMAP_WINDOW_LEN - size && (off & 7) == 0) {
 			sc->mgmt_off = sc->window + off;
 			sc->mgmt_size = size;
 		}
