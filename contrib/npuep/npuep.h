@@ -178,6 +178,26 @@ int	npuep_ring_dbell(struct npuep_softc *sc, int n);
 #define	RPC_CMD_LIF_ADD_UPDATE	3	/* make a logical interface */
 #define	RPC_CMD_LIF_DELETE	4
 #define	RPC_CMD_PPORT_UPDATE	5	/* bind a port tag to one: u8 iface, u8 rsvd, u16 tag */
+#define	RPC_CMD_LO_LIF_READ	37	/* read the interface table back - no side effects */
+
+/*
+ * The answer, written back into the same host buffer the command came from. rc carries an errno
+ * in its low bits when RPC_RC_ERRNO is set, so a non-zero rc is not automatically a transport
+ * failure - the target may simply be refusing the request, which is itself an answer.
+ */
+#define	RPC_RESP_RC		0x00	/* u16 */
+#define	  RPC_RC_ERRNO		(1U << 15)
+#define	RPC_RESP_DESC_DONE	0x02	/* u8  */
+#define	RPC_RESP_MAGIC_SEED	0x04	/* u16 */
+#define	RPC_RESP_PAYLOAD_LEN	0x06	/* u16 */
+#define	RPC_RESP_PAYLOAD	0x08
+
+/* Every LO_*_READ takes the same twelve bytes. */
+#define	RPC_TBL_S_INDEX		0x00	/* u32 */
+#define	RPC_TBL_NUM_ENTRIES	0x04	/* u16 */
+#define	RPC_TBL_FLAGS		0x06	/* u16 */
+#define	RPC_TBL_E_INDEX		0x08	/* u32 */
+#define	RPC_TBL_REQ_SIZE	12
 
 #define	RPC_DATA_MAX_SIZE	4096
 
