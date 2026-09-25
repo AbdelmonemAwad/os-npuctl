@@ -24,6 +24,29 @@ Ownership is carried entirely by the two ring indices. An implementation that wa
 debug hack left in the published source. `pcinet_tx_done` is consequently unreachable code, and
 would corrupt the peer's index if it were revived as written.
 
+This was the obvious thing to doubt - a vendor could patch those two lines for a release build
+without touching what it publishes - so it was checked against the binary that actually ships on
+the appliance. It is there:
+
+```
+  16d8:  call   mv_get_num_dbell
+  16dd:  test   eax,eax                      only the error code is examined
+  16df:  jne    <error>
+  16e5:  mov    BYTE PTR [rbx+0xa89],0x1     polling   = 1, an immediate
+
+  16fa:  mov    DWORD PTR [rsp+0x4],0x0      dbell_nr  = 0, plainly visible
+  1702:  call   mv_get_num_dbell
+  1720:  mov    BYTE PTR [rbx+0xa8a],0x0     rx_notify = 0, an immediate
+```
+
+The count the call returns is written to a stack slot and never read again; both flags are
+stored as constants, which is exactly what the source compiles to once the override is folded.
+The shipped driver and the published source agree, so a port should not implement a receive
+interrupt for this interface at all.
+
+`mv_request_dbell_irq` *is* still called, so a handler does get registered. It simply never
+fires, because the far side has been told not to notify.
+
 **Addresses must be below 2^36.** The coprocessor maps host memory through a single window of
 64 GiB starting at bus address zero, and `facility_host.c:837` constrains the host side to match
 with `dma_set_mask_and_coherent(DMA_BIT_MASK(36))`. On FreeBSD that is `lowaddr = 0xFFFFFFFFF`
@@ -136,8 +159,6 @@ they are freed, and a reset of the coprocessor is the only thing that makes that
 
 ## Still open
 
-- Whether the appliance's shipped target binary matches this GPL drop, specifically those two
-  `dbell_nr = 0` lines. A vendor patch that restores doorbells would change the receive path.
 - Whether a FreeBSD host with an active IOMMU produces bus addresses under 2^36 when the busdma
   tag asks for them. The target adds the published address to a linear window, so whatever the
   host publishes has to be exactly what appears on the bus.
