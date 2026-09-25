@@ -117,13 +117,17 @@ not loads and stores.
 Nothing here implements it. [docs/giu.md](docs/giu.md) is the specification, read out of the
 vendor's GPL `giu_nic` source, including three defects the vendor fixed after publishing it.
 
-One question in that document is open and it is the one that matters: **how the fourteen ports
-are told apart.** The receive descriptor has a `port_num` field that the vendor's host driver
-never reads, and the harvested port map shows a VLAN 4095 subinterface on every coprocessor-side
-port - a tag that is reserved in 802.1Q and cannot by itself distinguish fourteen of anything.
-Settling that needs the coprocessor side, not the host side. Until it is settled, an
-implementation can carry traffic on one trunk but cannot present fourteen interfaces, and
-fourteen interfaces is the point.
+**How the fourteen ports are told apart is settled**: a two-byte port identifier prepended to
+every frame in network order, in front of the Ethernet header. Not the descriptor's `port_num`
+field, which the vendor's host driver never reads, and not a VLAN tag - an earlier reading of the
+harvested port map blamed the VLAN 4095 subinterface, and that was wrong, because 4095 is the same
+on all fourteen and so cannot distinguish them.
+
+That splits stage 4 into two pieces that are worth doing in order. **Fourteen interfaces that
+carry traffic** need the GIU trunk and the two-byte tag, both fully specified. **Fourteen
+interfaces whose link state, speed and MTU can be read and set** need Sophos's NetAgent message
+set, which rides the AGNIC custom channel and is not published - it has to be recovered from
+`mv_nwa_host` the way the MCP2210 command map was recovered from `xgs-usb-spi-flash`.
 
 ## Why the module is not loaded automatically
 

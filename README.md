@@ -33,8 +33,10 @@ the appliance talks over. It is specified in [docs/mvmgmt.md](docs/mvmgmt.md) an
 
 The fourteen front ports belong to a second, much larger facility: GIU, a full NIC with a command
 channel, traffic classes, buffer pools and offloads. It is specified in
-[docs/giu.md](docs/giu.md) and **not implemented**. One question in that document is still open
-and it is the one that matters - how the fourteen ports are told apart on a single trunk.
+[docs/giu.md](docs/giu.md) and **not implemented**. How the fourteen ports are told apart on one
+trunk is answered there: a two-byte port identifier in front of every frame. What is not
+published, and would have to be recovered from a binary, is the message set that reads and sets
+each port's link state, speed and MTU.
 
 [DESIGN.md](DESIGN.md) says where the line currently is. If you are looking for working front
 ports today, this is not that yet. It is the part underneath them, and it is the part that had to
