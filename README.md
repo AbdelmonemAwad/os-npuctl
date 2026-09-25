@@ -25,13 +25,20 @@ At that point the coprocessor stops waiting and starts its own dataplane.
 
 ## What this does not do yet
 
-**It does not move packets.** The management interface and the datapath that would carry the
-front ports are not implemented; the work in progress is in `contrib/npuep/npumgmt.c`, which is
-deliberately not in the build. [DESIGN.md](DESIGN.md) says where the line currently is;
-[docs/mvmgmt.md](docs/mvmgmt.md) is the specification the next piece is being written against.
+**It moves packets on the management link, and not on the front ports.** `mvmgmt0` carries
+traffic between the host and the coprocessor over two rings in host memory - verified on the
+hardware, zero loss in both directions - and it is the interface every Sophos diagnostic tool on
+the appliance talks over. It is specified in [docs/mvmgmt.md](docs/mvmgmt.md) and implemented in
+`contrib/npuep/npumgmt.c`.
 
-If you are looking for working ports today, this is not that yet. It is the part underneath it,
-and it is the part that had to exist first.
+The fourteen front ports belong to a second, much larger facility: GIU, a full NIC with a command
+channel, traffic classes, buffer pools and offloads. It is specified in
+[docs/giu.md](docs/giu.md) and **not implemented**. One question in that document is still open
+and it is the one that matters - how the fourteen ports are told apart on a single trunk.
+
+[DESIGN.md](DESIGN.md) says where the line currently is. If you are looking for working front
+ports today, this is not that yet. It is the part underneath them, and it is the part that had to
+exist first.
 
 ## Hardware
 

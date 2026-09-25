@@ -27,13 +27,14 @@ it over PCIe.
 ```
  1  release the NPU from reset            DONE   src/etc/rc.syshook.d/early/01-npuctl
  2  complete the facility handshake       DONE   contrib/npuep/npuep.c
- 3  the management interface, mvmgmt0     WIP    contrib/npuep/npumgmt.c, not in the build
- 4  the GIU datapath and the 14 ports     NOT STARTED
+ 3  the management interface, mvmgmt0     WORKING  contrib/npuep/npumgmt.c
+ 4  the GIU datapath and the 14 ports     SPECIFIED, not implemented
 ```
 
-Stage 1 and 2 are the ones in this repository as working code. Stage 3 has its memory layer
-written and verified against the vendor source; the ring protocol is not finished. Stage 4 is
-weeks of work and nothing has been written for it.
+Stages 1 to 3 are in this repository as working code, verified on the hardware: `mvmgmt0` carries
+traffic to and from the coprocessor with no loss in either direction. Stage 4 has a specification
+read out of the vendor source - [docs/giu.md](docs/giu.md) - and no implementation. It is a much
+larger protocol than stage 3, and one question in it is still open.
 
 ### Stage 1 - reset
 
@@ -104,12 +105,25 @@ prove the model, and it is the link the vendor's own diagnostic tools use - on t
 
 ### Stage 4 - the datapath
 
-One netdev carrying all fourteen ports over a GIU/AGNIC ring pair, with the ports separated by
-VLAN 4095 tags on a single trunk. Sixteen management opcodes, 256-entry command and notification
-rings of 64-byte descriptors, and a DMA path that has to be right.
+Not a ring pair like stage 3. GIU is a whole NIC: thirty management commands over a 64-byte
+descriptor channel, up to eight traffic classes each with its own queues, a buffer pool per
+receive queue, checksum offload in both directions, VLAN filtering, and a per-queue MSI-X vector.
 
-Nothing here implements it. The protocol is documented in
-[docs/facility-protocol.md](docs/facility-protocol.md) as far as it has been read.
+The split is also inverted. In stage 3 both rings and both index pairs live in host memory. Here
+the configuration structure and **every ring's producer and consumer index live in the device's
+BAR0**, while the descriptors and buffers live in host memory - so the indices are MMIO accesses,
+not loads and stores.
+
+Nothing here implements it. [docs/giu.md](docs/giu.md) is the specification, read out of the
+vendor's GPL `giu_nic` source, including three defects the vendor fixed after publishing it.
+
+One question in that document is open and it is the one that matters: **how the fourteen ports
+are told apart.** The receive descriptor has a `port_num` field that the vendor's host driver
+never reads, and the harvested port map shows a VLAN 4095 subinterface on every coprocessor-side
+port - a tag that is reserved in 802.1Q and cannot by itself distinguish fourteen of anything.
+Settling that needs the coprocessor side, not the host side. Until it is settled, an
+implementation can carry traffic on one trunk but cannot present fourteen interfaces, and
+fourteen interfaces is the point.
 
 ## Why the module is not loaded automatically
 
