@@ -151,6 +151,8 @@ struct npuep_softc {
 	bus_size_t		 mgmt_size;
 	bus_size_t		 giu_off;	/* giu facility, absolute in BAR0 */
 	bus_size_t		 giu_size;
+	bus_size_t		 nwa_off;	/* network agent facility, absolute in BAR0 */
+	bus_size_t		 nwa_size;
 
 	int			 nvec;
 	int			 busmaster;	/* we turned it on, we turn it off */
@@ -322,6 +324,24 @@ npuep_read_barmap(struct npuep_softc *sc)
 			} else {
 				device_printf(dev,
 				    "giu facility [off %#x size %u] does not fit BAR0 - "
+				    "ignoring it\n", off, size);
+			}
+		}
+
+		/*
+		 * And the network agent's window, also on BAR0. This one decides whether the
+		 * front ports exist at all - see contrib/npuep/npunwa.c.
+		 */
+		if (type == MV_FACILITY_NW_AGENT && bar == 0) {
+			bus_size_t bar0_len = rman_get_size(sc->bar0);
+
+			if (size >= NPUEP_NWA_MIN_SIZE && (bus_size_t)size <= bar0_len &&
+			    (bus_size_t)off <= bar0_len - size && (off & 7) == 0) {
+				sc->nwa_off = off;
+				sc->nwa_size = size;
+			} else {
+				device_printf(dev,
+				    "nwa facility [off %#x size %u] does not fit BAR0 - "
 				    "ignoring it\n", off, size);
 			}
 		}
@@ -634,6 +654,29 @@ npuep_attach(device_t dev)
 		} else {
 			device_printf(dev, "no giu facility in the barmap\n");
 		}
+
+		/*
+		 * And the network agent, last, because it is the only thing here that changes
+		 * the state of the outside world: it brings the front ports up. Everything
+		 * above it is this machine talking to a coprocessor; this puts light on a panel
+		 * and link on a wire.
+		 */
+		if (sc->nwa_off != 0 || sc->nwa_size != 0) {
+			struct npuep_facility nfac;
+
+			nfac.dev = dev;
+			nfac.res = sc->bar0;
+			nfac.off = sc->nwa_off;
+			nfac.size = sc->nwa_size;
+			nfac.parent_tag = bus_get_dma_tag(dev);
+			nfac.first_msix = npuep_first_msix(MV_FACILITY_NW_AGENT);
+			nfac.nmsix = npuep_t2h_dbells[MV_FACILITY_NW_AGENT];
+
+			if (npunwa_attach(&nfac) != 0)
+				device_printf(dev, "network agent did not attach\n");
+		} else {
+			device_printf(dev, "no nwa facility in the barmap\n");
+		}
 	} else {
 		device_printf(dev, "no mvmgmt facility in the barmap\n");
 	}
@@ -658,6 +701,7 @@ npuep_detach(device_t dev)
 	int i;
 
 	/* Withdraw from the far side before anything underneath it is torn down, newest first. */
+	npunwa_detach();
 	npugiu_detach();
 	npumgmt_detach();
 

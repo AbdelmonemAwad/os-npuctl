@@ -49,10 +49,16 @@ struct npuep_facility {
  */
 #define	NPUEP_GIU_MIN_SIZE	0x400
 
+/* The smallest nwa window that can hold the mailbox header, the request and its reply. */
+#define	NPUEP_NWA_MIN_SIZE	0x100
+
 int	npumgmt_attach(struct npuep_facility *fac);
 void	npumgmt_detach(void);
 
 int	npugiu_attach(struct npuep_facility *fac);
 void	npugiu_detach(void);
+
+int	npunwa_attach(struct npuep_facility *fac);
+void	npunwa_detach(void);
 
 #endif /* _NPUEP_H_ */
