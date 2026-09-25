@@ -116,7 +116,13 @@
 #define	AGNIC_CC_PF_SET_LOOPBACK	0x11
 #define	AGNIC_CC_PF_ADD_VLAN		0x12
 #define	AGNIC_CC_PF_REMOVE_VLAN		0x13
-#define	AGNIC_CC_PF_GET_GP_STATS	0x14	/* THIS is the GIU port's own counters */
+/*
+ * The GIU port's own counters - and NOT IMPLEMENTED by this firmware. Both were tried on the
+ * hardware and both time out with no reply at all, which is why the stats sysctl reports the
+ * driver's own figures instead. Kept because knowing which question the device refuses is worth
+ * as much as knowing which it answers.
+ */
+#define	AGNIC_CC_PF_GET_GP_STATS	0x14
 #define	AGNIC_CC_PF_GET_GP_QUEUE_STATS	0x15
 #define	AGNIC_CC_PF_LINK_INFO		0x19
 #define	AGNIC_CC_GET_CAPABILITIES	0x1e
