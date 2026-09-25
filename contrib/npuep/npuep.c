@@ -563,6 +563,23 @@ npuep_sysctl_rpc_state(SYSCTL_HANDLER_ARGS)
 	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
 }
 
+const struct npuep_front_port npuep_front_ports[NPUEP_NFRONT] = {
+	{ "Port1",  0x8100,  0,  1 },
+	{ "Port2",  0x8200,  1,  2 },
+	{ "Port3",  0x8300,  2,  3 },
+	{ "Port4",  0x8400,  3,  4 },
+	{ "Port5",  0x8500,  4,  5 },
+	{ "Port6",  0x8600,  5,  6 },
+	{ "Port7",  0x8700,  6,  7 },
+	{ "Port8",  0x8800,  7,  8 },
+	{ "Port9",  0x0001, 10,  9 },
+	{ "Port10", 0x0003, 12, 10 },
+	{ "Port11", 0x0004, 13, 11 },
+	{ "Port12", 0x0002, 11, 12 },
+	{ "PortF1", 0x8900,  9, 13 },
+	{ "PortF2", 0x8a00,  8, 14 },
+};
+
 /*
  * Ring one of the target's doorbells.
  *

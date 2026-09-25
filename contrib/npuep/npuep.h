@@ -122,6 +122,31 @@ int	npuep_ring_dbell(struct npuep_softc *sc, int n);
 
 /*
  * ---------------------------------------------------------------------------------------
+ * The fourteen front ports.
+ *
+ * Two families, and they do not follow one rule. Ten hang off an integrated switch and carry
+ * identifiers of the form 0x8000 + n * 0x100; the remaining four are separate MACs on the SoC and
+ * carry 0x0001 to 0x0004. The vendor's own kernel names them accordingly - pport_l0s0p1 through
+ * p10 for the switch, and pport_l1 through l4 for the rest - and that is why the coprocessor's
+ * port-to-interface table has sixty-five thousand entries rather than sixteen.
+ *
+ * The logical interface numbers here are the vendor's, read out of its boot log rather than
+ * invented. Keeping them means the fastpath sees the assignment it was built expecting, and it is
+ * also what makes the tag order below look wrong when it is not: 0x0002 is Port12, not Port10.
+ * ---------------------------------------------------------------------------------------
+ */
+struct npuep_front_port {
+	const char	*label;		/* what is printed on the chassis */
+	uint16_t	 tag;		/* the coprocessor's identifier for it */
+	uint8_t		 iface_id;	/* the logical interface the vendor binds it to */
+	uint8_t		 unit;		/* this host's interface number for it */
+};
+
+#define	NPUEP_NFRONT	14
+extern const struct npuep_front_port npuep_front_ports[NPUEP_NFRONT];
+
+/*
+ * ---------------------------------------------------------------------------------------
  * The control-message channel's state block, at the start of its window.
  *
  * These are not inferred. Sophos ships usfp_rh.ko built with -g3, so the compiler recorded every
@@ -193,6 +218,34 @@ int	npuep_ring_dbell(struct npuep_softc *sc, int n);
 #define	RPC_RESP_PAYLOAD_LEN	0x06	/* u16 */
 #define	RPC_RESP_PAYLOAD	0x08
 
+/*
+ * Making a logical interface, eighteen bytes. The index is not an index into anything the host
+ * chooses freely: it is (iface_id << 12) | vlan_id, so one interface owns a block of 4096 and an
+ * untagged port is its vlan zero. update_mask is a selector, and the one value that means "create
+ * this" rather than "change these fields" is 0x00FF.
+ */
+#define	RPC_LIF_INDEX		0x00	/* u32 */
+#define	  RPC_LIF_IFACE_SHIFT	12
+#define	RPC_LIF_MAC		0x04	/* u8[6] */
+#define	RPC_LIF_MTU		0x0a	/* u16 - not range checked by the target */
+#define	RPC_LIF_FLAGS		0x0c	/* u16 */
+#define	  RPC_LIF_FWD_L2		0x0001	/* fwd_mode, bits 0-1. Zero means DROP. */
+#define	  RPC_LIF_FWD_L3		0x0002
+#define	  RPC_LIF_ADMIN_DISABLED	0x0004	/* drops everything */
+#define	  RPC_LIF_OFFLOAD_DISABLED	0x0008	/* gives everything to the host - what we want */
+#define	RPC_LIF_UPDATE_MASK	0x10	/* u16 */
+#define	  RPC_LIF_CREATE		0x00FF
+#define	RPC_LIF_REQ_SIZE	18
+
+/*
+ * Binding a front port to one, four bytes. The tag here is LITTLE endian, which is the opposite
+ * of the same value in the datapath's frame header - that one is big endian. They are the same
+ * number and they are written the other way round, and nothing warns.
+ */
+#define	RPC_PPORT_IFACE		0x00	/* u8 */
+#define	RPC_PPORT_TAG		0x02	/* u16 */
+#define	RPC_PPORT_REQ_SIZE	4
+
 /* Every LO_*_READ takes the same twelve bytes. */
 #define	RPC_TBL_S_INDEX		0x00	/* u32 */
 #define	RPC_TBL_NUM_ENTRIES	0x04	/* u16 */
@@ -216,6 +269,9 @@ void	npugiu_detach(void);
 
 int	npunwa_attach(struct npuep_facility *fac);
 void	npunwa_detach(void);
+
+/* What address the datapath gave one front port's interface. ENXIO if it never came up. */
+int	npugiu_front_mac(int idx, uint8_t *out);
 
 int	npurpc_attach(struct npuep_facility *fac);
 void	npurpc_detach(void);
