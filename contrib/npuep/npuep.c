@@ -106,6 +106,21 @@ static const int npuep_t2h_dbells[MV_FACILITY_COUNT] = {
 };
 #define	NPUEP_TOTAL_DBELLS	5
 
+/*
+ * Which MSI-X vector a facility's doorbells start at. The vectors are handed out in facility
+ * order, so this is just the running total of everything before it - and it has to agree with
+ * the order npuep_setup_msix() walks, which is the same loop.
+ */
+static __inline int
+npuep_first_msix(int facility)
+{
+	int i, n = 0;
+
+	for (i = 0; i < facility; i++)
+		n += npuep_t2h_dbells[i];
+	return (n);
+}
+
 static const char *npuep_facility_name[MV_FACILITY_COUNT] = {
 	"ctrl", "mvmgmt", "nwa", "rpc", "giu"
 };
@@ -593,6 +608,8 @@ npuep_attach(device_t dev)
 		fac.off = sc->mgmt_off;
 		fac.size = sc->mgmt_size;
 		fac.parent_tag = bus_get_dma_tag(dev);
+		fac.first_msix = npuep_first_msix(MV_FACILITY_MGMT_NETDEV);
+		fac.nmsix = npuep_t2h_dbells[MV_FACILITY_MGMT_NETDEV];
 
 		if (npumgmt_attach(&fac) != 0)
 			device_printf(dev, "management interface did not attach\n");
@@ -609,6 +626,8 @@ npuep_attach(device_t dev)
 			gfac.off = sc->giu_off;
 			gfac.size = sc->giu_size;
 			gfac.parent_tag = bus_get_dma_tag(dev);
+			gfac.first_msix = npuep_first_msix(MV_FACILITY_GIU);
+			gfac.nmsix = npuep_t2h_dbells[MV_FACILITY_GIU];
 
 			if (npugiu_attach(&gfac) != 0)
 				device_printf(dev, "giu command channel did not attach\n");

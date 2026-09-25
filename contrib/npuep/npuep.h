@@ -32,6 +32,15 @@ struct npuep_facility {
 	bus_size_t	 off;		/* absolute offset of the window within it */
 	bus_size_t	 size;		/* how much of it is ours */
 	bus_dma_tag_t	 parent_tag;	/* parent for any DMA the consumer allocates */
+
+	/*
+	 * The MSI-X vectors npuep allocated for THIS facility. The coprocessor is told a vector
+	 * id per queue and signals us by writing the message itself, so a consumer must hand it
+	 * a number npuep actually owns - inventing one points the device at a table entry
+	 * belonging to something else.
+	 */
+	int		 first_msix;	/* index of this facility's first vector */
+	int		 nmsix;		/* how many it has */
 };
 
 /*
