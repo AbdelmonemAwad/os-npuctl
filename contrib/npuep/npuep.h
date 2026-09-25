@@ -95,6 +95,23 @@ struct npuep_facility {
 #define	  CTRL_DBELL_DATA	0x08	/* u32 */
 #define	CTRL_DBELL_MAX		16	/* more than the five this board has */
 
+/*
+ * And the address in each entry is an OFFSET, not somewhere to write directly. The vendor's host
+ * adds its target-register BAR to it:
+ *
+ *	dbell_msg->address = map_dbell->address + trgt_reg_addr;	  facility_host.c
+ *	trgt_reg_addr = (u64)fclts_cnf->trg_reg_bar.vaddr;
+ *
+ * and its own sysfs calls that BAR "bar4 target reg". So ringing a doorbell is an MMIO write into
+ * BAR4 - a register on the endpoint - and NOT a write to a host physical address. The difference
+ * matters more than most: this board publishes offset 0x280040, and 0x280040 as a host physical
+ * address is low system memory. Nothing was written there until this was settled.
+ */
+#define	NPUEP_DBELL_BAR		4
+
+struct npuep_softc;
+int	npuep_ring_dbell(struct npuep_softc *sc, int n);
+
 int	npumgmt_attach(struct npuep_facility *fac);
 void	npumgmt_detach(void);
 
