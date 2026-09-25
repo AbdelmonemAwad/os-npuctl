@@ -3,9 +3,13 @@
 A virtual Ethernet link between the host and the coprocessor. No wire: two rings in **host**
 memory, which the coprocessor reaches through a linear outbound window.
 
-Not implemented yet. This is the specification the implementation is being written against,
-extracted from Marvell's GPL `pcinet` source and checked line by line. Where the source and its
-own documentation disagree, the code wins and it says so.
+Implemented in `contrib/npuep/npumgmt.c`. The link reaches `PCINET_LINK_ESTABLISHED` - the
+coprocessor's own reply, which it sends only once it has accepted the ring addresses it was
+handed - and `mvmgmt0` appears as an ordinary Ethernet interface.
+
+This page is the specification that implementation was written against, extracted from
+Marvell's GPL `pcinet` source and checked line by line. Where the source and its own
+documentation disagree, the code wins and it says so.
 
 ## The three things that overturn the obvious guess
 
@@ -109,6 +113,22 @@ For each ring exactly one side writes `push_idx` and the other writes `pop_idx`,
 needs a read-modify-write across the bus - only release ordering before publishing an index, and
 a host-local lock to serialise multiple transmitters. The two indices are adjacent 32-bit fields
 in the same 8-byte word and are written by opposite sides, so **only 32-bit accesses are legal**.
+
+### And therefore: never subscript with an index you read back
+
+That rule binds both sides, and a host can only keep its own half of it. The far side is an
+AArch64 core, where merging two adjacent 32-bit stores into a single 64-bit one is something the
+compiler does as a matter of routine - so a peer that writes only its own field in C can still
+put a doubleword on the bus, and it lands on the host's field as well.
+
+The consequence is not a lost count. A host that reads its own index back out of that word and
+then uses it to subscript the entry array or the buffer table turns the peer's store into a wild
+pointer, and faults inside the packet copy with a backtrace that points nowhere near the cause.
+That was a real page-fault panic on this appliance, seconds after the first frames moved.
+
+So the host keeps its own index in its own softc, writes it out to the shared word and never
+reads it back; and it range-checks the peer's index against the ring size on every use, treating
+an out-of-range value as a dead link rather than clamping it and carrying on.
 
 `q_full` is `(push + 1 == pop) || (push == q_last && pop == 0)`, so one slot is always left
 empty.

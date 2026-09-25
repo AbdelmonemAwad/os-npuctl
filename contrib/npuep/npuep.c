@@ -60,6 +60,8 @@
 #include <dev/pci/pcireg.h>
 #include <dev/pci/pcivar.h>
 
+#include "npuep.h"
+
 static int	npuep_detach(device_t);
 
 /* barmap.h */
@@ -130,6 +132,8 @@ struct npuep_softc {
 
 	bus_size_t		 window;	/* facility window in BAR2 */
 	bus_size_t		 ctrl;		/* ctrl_map, absolute in BAR2 */
+	bus_size_t		 mgmt_off;	/* mvmgmt facility, absolute in BAR2 */
+	bus_size_t		 mgmt_size;
 
 	int			 nvec;
 	int			 busmaster;	/* we turned it on, we turn it off */
@@ -265,6 +269,17 @@ npuep_read_barmap(struct npuep_softc *sc)
 		device_printf(dev, "  facility %-7s bar%u off 0x%06x size %u\n",
 		    type < MV_FACILITY_COUNT ? npuep_facility_name[type] : "?",
 		    bar == 0 ? 0 : 2, off, size);
+
+		/*
+		 * Remember where the management facility lives while the map is in front of
+		 * us. Same rule as the control facility: bound it against the window we
+		 * actually mapped, because the offset came from the coprocessor.
+		 */
+		if (type == MV_FACILITY_MGMT_NETDEV && bar == 1 &&
+		    size != 0 && off <= NPU_BARMAP_WINDOW_LEN - size) {
+			sc->mgmt_off = sc->window + off;
+			sc->mgmt_size = size;
+		}
 
 		if (type == MV_FACILITY_CONTROL) {
 			if (bar != 1) {		/* SHM_BAR2 == 1 */
@@ -531,6 +546,30 @@ npuep_attach(device_t dev)
 
 	npuep_add_sysctls(sc);
 
+	/*
+	 * The management interface, once the handshake is done and not before: it publishes host
+	 * memory addresses to the coprocessor, and doing that before the control facility agrees
+	 * we exist is the ordering that caused a panic earlier in this project.
+	 *
+	 * Its failure is not this driver's failure. The endpoint, the doorbells and the handshake
+	 * are useful on their own, and a machine that keeps them is easier to work on than one
+	 * that detaches everything because a netdev would not come up.
+	 */
+	if (sc->mgmt_off != 0) {
+		struct npuep_facility fac;
+
+		fac.dev = dev;
+		fac.res = sc->bar2;
+		fac.off = sc->mgmt_off;
+		fac.size = sc->mgmt_size;
+		fac.parent_tag = bus_get_dma_tag(dev);
+
+		if (npumgmt_attach(&fac) != 0)
+			device_printf(dev, "management interface did not attach\n");
+	} else {
+		device_printf(dev, "no mvmgmt facility in the barmap\n");
+	}
+
 	NPUEP_LOCK(sc);
 	sc->running = 1;
 	callout_reset(&sc->heartbeat, hz / NPUEP_HEARTBEAT_HZ, npuep_heartbeat,
@@ -549,6 +588,9 @@ npuep_detach(device_t dev)
 {
 	struct npuep_softc *sc = device_get_softc(dev);
 	int i;
+
+	/* Withdraw from the far side before anything underneath it is torn down. */
+	npumgmt_detach();
 
 	if (mtx_initialized(&sc->mtx)) {
 		NPUEP_LOCK(sc);
