@@ -491,6 +491,7 @@ struct npumgmt_softc {
 	struct npumgmt_ring	 rx;		/* the coprocessor fills it, we drain it   */
 	struct npumgmt_ring	 tx;		/* we fill it, the coprocessor drains it   */
 	int			 running;
+	int			 published;	/* WE have handed this peer our ring addresses */
 	int			 link;		/* last link_status we read */
 	uint64_t		 rx_packets, rx_bytes, rx_dropped;
 	uint64_t		 tx_packets, tx_bytes, tx_dropped;
@@ -721,6 +722,8 @@ npumgmt_tick(void *arg)
 		if (sc->link != -1) {
 			device_printf(sc->fac.dev, "mgmt: endpoint gone, link down\n");
 			sc->link = -1;
+			sc->published = 0;
+			if_setdrvflagbits(ifp, 0, IFF_DRV_RUNNING);
 			if_link_state_change(ifp, LINK_STATE_DOWN);
 		}
 		callout_reset(&sc->poll, hz / 100, npumgmt_tick, sc);
@@ -731,13 +734,23 @@ npumgmt_tick(void *arg)
 		device_printf(sc->fac.dev, "mgmt: link 0x%02x -> 0x%02x\n",
 		    sc->link, link);
 		sc->link = link;
-		if_link_state_change(ifp,
-		    link == PCINET_LINK_ESTABLISHED ? LINK_STATE_UP : LINK_STATE_DOWN);
-		if (link == PCINET_LINK_ESTABLISHED)
-			if_setdrvflagbits(ifp, IFF_DRV_RUNNING, IFF_DRV_OACTIVE);
+
+		if (link == PCINET_LINK_ESTABLISHED && sc->published) {
+			if_link_state_change(ifp, LINK_STATE_UP);
+		} else {
+			/*
+			 * Anything that is not an established link we published ourselves puts
+			 * the interface back to not-running, so that bringing it up again
+			 * republishes instead of silently doing nothing. Before, the flag was
+			 * only ever set and the link could never be re-established.
+			 */
+			sc->published = 0;
+			if_setdrvflagbits(ifp, 0, IFF_DRV_RUNNING);
+			if_link_state_change(ifp, LINK_STATE_DOWN);
+		}
 	}
 
-	if (link == PCINET_LINK_ESTABLISHED) {
+	if (link == PCINET_LINK_ESTABLISHED && sc->published) {
 		npumgmt_rx(sc, 64, &head, &tail);
 		/*
 		 * The far side may have drained the TX ring since we last looked, and nothing
@@ -836,6 +849,9 @@ npumgmt_publish(struct npumgmt_softc *sc)
 	bus_barrier(sc->fac.res, sc->fac.off, PCINET_CFG_SIZE, BUS_SPACE_BARRIER_WRITE);
 	cfg_wr4(sc, CFG_LINK_STATUS, PCINET_LINK_HOST_UP);
 
+	sc->published = 1;
+	if_setdrvflagbits(sc->ifp, IFF_DRV_RUNNING, IFF_DRV_OACTIVE);
+
 	device_printf(sc->fac.dev, "mgmt: published rx %#jx tx %#jx, link HOST_UP\n",
 	    (uintmax_t)sc->rx.ctl_phys, (uintmax_t)sc->tx.ctl_phys);
 }
@@ -857,8 +873,20 @@ npumgmt_withdraw(struct npumgmt_softc *sc)
 
 	mtx_assert(&sc->mtx, MA_OWNED);
 
+	sc->published = 0;
+
+	/*
+	 * An all-ones read says our reads of BAR2 are unanswered. It does NOT say the
+	 * coprocessor has stopped writing into host RAM - those are different directions
+	 * through different hardware, and the outbound path does not need the host's config
+	 * cycles to work. Treating silence as consent here is how 4 MB gets handed back to the
+	 * allocator while something is still filling it.
+	 *
+	 * So this is a refusal, not a success. The caller leaks the memory instead, which is
+	 * the cheap side of the trade.
+	 */
 	if (cfg_rd4(sc, CFG_LINK_STATUS) == 0xFFFFFFFFU)
-		return (0);		/* endpoint already gone; nothing is reading our memory */
+		return (ETIMEDOUT);
 
 	cfg_wr4(sc, CFG_LINK_STATUS, PCINET_NETIF_STOP);
 	cfg_wr4(sc, CFG_LINK_CHANGE, 1);
@@ -866,8 +894,10 @@ npumgmt_withdraw(struct npumgmt_softc *sc)
 	for (i = 0; i < 200; i++) {		/* 2 seconds */
 		uint32_t s = cfg_rd4(sc, CFG_LINK_STATUS);
 
-		if (s == PCINET_LINK_IS_DOWN || s == 0xFFFFFFFFU)
-			return (0);
+		if (s == PCINET_LINK_IS_DOWN)
+			return (0);	/* the target said so itself - the only proof there is */
+		if (s == 0xFFFFFFFFU)
+			return (ETIMEDOUT);	/* see above: silence is not an answer */
 		MGMT_UNLOCK(sc);
 		pause("npumgw", hz / 100);
 		MGMT_LOCK(sc);
@@ -905,7 +935,15 @@ npumgmt_init_locked(struct npumgmt_softc *sc)
 
 	if (!sc->running)
 		return;
-	if ((if_getdrvflags(sc->ifp) & IFF_DRV_RUNNING) != 0)
+
+	/*
+	 * Gate on what THIS driver did, not on IFF_DRV_RUNNING. The flag used to be raised by
+	 * the tick on reading LINK_ESTABLISHED out of BAR2 - a word the peer writes and that
+	 * survives a host reboot. A stale one made the driver believe it had already published
+	 * rings it had never published, so the coprocessor kept writing to a previous host's
+	 * addresses and nothing here ever noticed.
+	 */
+	if (sc->published)
 		return;
 
 	npumgmt_publish(sc);
@@ -1020,6 +1058,12 @@ npumgmt_attach(struct npuep_facility *fac)
 
 	MGMT_LOCK(sc);
 	sc->running = 1;
+	/*
+	 * Start the state machine from a state we wrote. link_status survives a host reboot in
+	 * the coprocessor's BAR, and the vendor's own driver never initialises it - so without
+	 * this the first tick can read a LINK_ESTABLISHED left behind by a previous host.
+	 */
+	cfg_wr4(sc, CFG_LINK_STATUS, PCINET_LINK_IS_DOWN);
 	callout_reset(&sc->poll, hz / 100, npumgmt_tick, sc);
 	MGMT_UNLOCK(sc);
 
@@ -1062,7 +1106,7 @@ npumgmt_detach(void)
 	 * writing into it is a corrupted machine some minutes later with nothing to point at.
 	 */
 	MGMT_LOCK(sc);
-	if (npumgmt_withdraw(sc) == 0) {
+	if (sc->rx.fault == 0 && sc->tx.fault == 0 && npumgmt_withdraw(sc) == 0) {
 		MGMT_UNLOCK(sc);
 		npumgmt_free_ring(&sc->tx);
 		npumgmt_free_ring(&sc->rx);
