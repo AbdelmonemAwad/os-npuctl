@@ -1902,7 +1902,38 @@ npugiu_detach(void)
 	if (sc == NULL)
 		return;
 
+	/*
+	 * Say goodbye while the command channel is still up.
+	 *
+	 * This driver never did, and the cost was exactly one usable load per power cycle. The
+	 * coprocessor kept its PF initialised with the queues from the previous load, so the next
+	 * load's MGMT_ECHO was never answered - "giu command channel did not attach", no datapath,
+	 * and nothing short of pulling the power brought it back. PF_DISABLE stops the datapath;
+	 * PF_CLOSE releases the traffic classes and queues it was given.
+	 *
+	 * This has to happen here, before the flags are cleared and the callout is drained: the
+	 * command path refuses to send once running is clear, and it needs the poll still alive to
+	 * notice the answer.
+	 *
+	 * Neither command is worth refusing to unload over. If the endpoint has already stopped
+	 * decoding there is nobody left to tell. But say so when it fails, because a silent failure
+	 * here is precisely what the next load trips over.
+	 */
 	GIU_LOCK(sc);
+	if (sc->datapath && cfg_rd(sc, AGNIC_CFG_STATUS) != 0xFFFFFFFFU) {
+		uint8_t pz[8];
+		int cerr;
+
+		memset(pz, 0, sizeof(pz));
+		cerr = npugiu_command(sc, AGNIC_CC_PF_DISABLE, pz, 0);
+		if (cerr != 0)
+			device_printf(sc->fac.dev, "giu: PF_DISABLE failed (%d)\n", cerr);
+		else if ((cerr = npugiu_command(sc, AGNIC_CC_PF_CLOSE, pz, 0)) != 0)
+			device_printf(sc->fac.dev, "giu: PF_CLOSE failed (%d)\n", cerr);
+		else
+			device_printf(sc->fac.dev,
+			    "giu: datapath closed - the next load can have it back\n");
+	}
 	sc->running = 0;
 	sc->datapath = 0;
 	wakeup(&sc->answered);
