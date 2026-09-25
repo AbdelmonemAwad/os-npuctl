@@ -7,6 +7,6 @@
 # not work on this hardware even if it were.
 #
 KMOD	= npuep
-SRCS	= npuep.c npumgmt.c npugiu.c npunwa.c device_if.h bus_if.h pci_if.h opt_inet.h
+SRCS	= npuep.c npumgmt.c npugiu.c npunwa.c npurpc.c device_if.h bus_if.h pci_if.h opt_inet.h
 
 .include <bsd.kmod.mk>

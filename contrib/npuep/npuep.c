@@ -984,6 +984,27 @@ npuep_attach(device_t dev)
 		} else {
 			device_printf(dev, "no nwa facility in the barmap\n");
 		}
+
+	/*
+	 * And the control-message channel, which is the one facility that talks back through a
+	 * doorbell rather than being polled - so it is handed the register window's owner and the
+	 * number of the doorbell the target armed for it.
+	 */
+	if (sc->rpc_off != 0 && sc->rpc_size != 0) {
+		struct npuep_facility rfac;
+
+		memset(&rfac, 0, sizeof(rfac));
+		rfac.dev = dev;
+		rfac.res = sc->bar2;
+		rfac.off = sc->rpc_off;
+		rfac.size = sc->rpc_size;
+		rfac.parent_tag = bus_get_dma_tag(dev);
+		rfac.parent = sc;
+		rfac.dbell = 0;		/* every facility before this one declares none */
+
+		if (npurpc_attach(&rfac) != 0)
+			device_printf(dev, "the control-message channel did not attach\n");
+	}
 	} else {
 		device_printf(dev, "no mvmgmt facility in the barmap\n");
 	}
@@ -1008,6 +1029,7 @@ npuep_detach(device_t dev)
 	int i;
 
 	/* Withdraw from the far side before anything underneath it is torn down, newest first. */
+	npurpc_detach();
 	npunwa_detach();
 	npugiu_detach();
 	npumgmt_detach();
