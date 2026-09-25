@@ -504,6 +504,66 @@ npuep_setup_dbells(struct npuep_softc *sc)
 }
 
 /*
+ * The control-message channel's state, decoded.
+ *
+ * Reading the window as hex told us the target had published something and nothing more. This
+ * says what: which revision it speaks, whether the channel has been opened, and for every ring
+ * where its descriptors are and how far each side has got.
+ *
+ * Still read-only. Opening the channel means writing a magic word that makes the target start
+ * reading ring descriptors out of this window and DMA-ing to whatever host addresses they name -
+ * so it may not be written until those rings hold real addresses. A zeroed ring would point the
+ * coprocessor at host physical address zero.
+ */
+static int
+npuep_sysctl_rpc_state(SYSCTL_HANDLER_ARGS)
+{
+	struct npuep_softc *sc = arg1;
+	char buf[1024];
+	uint32_t magic, cfg;
+	int i, n = 0;
+
+	if (sc->rpc_size < RPC_STATE_SIZE)
+		return (ENXIO);
+
+	magic = bar2_read(sc, sc->rpc_off + RPC_ST_CFG_MAGIC);
+	cfg = bar2_read(sc, sc->rpc_off + RPC_ST_CFG_REVISION);
+
+	n = snprintf(buf, sizeof(buf),
+	    "magic %#010x (%s)  revision %u  active_hi_rings %u  reconfig_done %u",
+	    magic, magic == RPC_STATE_CFG_MAGIC ? "open" : "not opened by this host",
+	    cfg & 0xFFFF, (cfg >> 16) & 0xFF, (cfg >> 24) & 0xFF);
+
+	for (i = 0; i <= RPC_HI_RINGS_MAX; i++) {
+		bus_size_t r = sc->rpc_off +
+		    (i == 0 ? RPC_ST_RING_LO : RPC_ST_RINGS + (i - 1) * RPC_RING_SIZE);
+		uint64_t posted, done;
+		uint32_t roff, doff, dcnt, rcfg;
+
+		if (n > (int)sizeof(buf) - 140)
+			break;
+
+		posted = (uint64_t)bar2_read(sc, r + RPC_RING_POSTED) |
+		    ((uint64_t)bar2_read(sc, r + RPC_RING_POSTED + 4) << 32);
+		done = (uint64_t)bar2_read(sc, r + RPC_RING_DONE) |
+		    ((uint64_t)bar2_read(sc, r + RPC_RING_DONE + 4) << 32);
+		roff = bar2_read(sc, r + RPC_RING_OFFSET);
+		doff = bar2_read(sc, r + RPC_RING_DESC_OFFSET);
+		dcnt = bar2_read(sc, r + RPC_RING_DESC_COUNT);
+		rcfg = bar2_read(sc, r + RPC_RING_CFG);
+
+		n += snprintf(buf + n, sizeof(buf) - n,
+		    "\n  %-8s posted %ju done %ju  ring +%#x  desc +%#x x%u  "
+		    "num %u fclt %u dbell %u shared %u",
+		    i == 0 ? "low" : "high", (uintmax_t)posted, (uintmax_t)done,
+		    roff, doff, dcnt,
+		    rcfg & 0xFF, (rcfg >> 8) & 0xFF, (rcfg >> 16) & 0xFF, (rcfg >> 24) & 0xFF);
+	}
+
+	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
+}
+
+/*
  * Ring one of the target's doorbells.
  *
  * The write itself is trivial; everything difficult about it is knowing where. The address the
@@ -724,6 +784,10 @@ npuep_add_sysctls(struct npuep_softc *sc)
 	    "the host-to-target doorbells the coprocessor published: where to write, and what");
 
 	if (sc->rpc_size != 0) {
+		SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "rpc_state",
+		    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
+		    npuep_sysctl_rpc_state, "A",
+		    "the control-message channel's state block, decoded");
 		SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "rpc",
 		    CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0, npuep_sysctl_rpc, "A",
 		    "write \"offset words\" in hex, read back that part of the "
