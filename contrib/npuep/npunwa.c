@@ -328,15 +328,17 @@ npunwa_xfer(struct npunwa_softc *sc, const uint32_t *req, int nreq, uint32_t *re
  */
 static int
 npunwa_transact(struct npunwa_softc *sc, uint32_t op, uint32_t sub, uint32_t port,
-    uint32_t payload, uint32_t *reply, int nreply)
+    const uint32_t *pl, int npl, uint32_t *reply, int nreply)
 {
 	uint32_t req[NWA_REQ_SIZE / 4];
+	int i;
 
 	memset(req, 0, sizeof(req));
 	req[NWA_RQ_OP / 4] = op;
 	req[NWA_RQ_SUB / 4] = sub;
 	req[NWA_RQ_PORT / 4] = port;
-	req[NWA_RQ_PAYLOAD / 4] = payload;
+	for (i = 0; i < npl && (NWA_RQ_PAYLOAD / 4) + i < NWA_REQ_SIZE / 4; i++)
+		req[(NWA_RQ_PAYLOAD / 4) + i] = pl[i];
 
 	return (npunwa_xfer(sc, req, NWA_REQ_SIZE / 4, reply, nreply, NULL));
 }
@@ -348,8 +350,8 @@ npunwa_transact(struct npunwa_softc *sc, uint32_t op, uint32_t sub, uint32_t por
  * the next person's afternoon.
  */
 static int
-npunwa_command(struct npunwa_softc *sc, uint32_t op, uint32_t sub, uint32_t port,
-    uint32_t payload, uint32_t *reply, int nreply)
+npunwa_command_n(struct npunwa_softc *sc, uint32_t op, uint32_t sub, uint32_t port,
+    const uint32_t *pl, int npl, uint32_t *reply, int nreply)
 {
 	int err;
 
@@ -362,11 +364,20 @@ npunwa_command(struct npunwa_softc *sc, uint32_t op, uint32_t sub, uint32_t port
 	}
 
 	sc->busy = 1;
-	err = npunwa_transact(sc, op, sub, port, payload, reply, nreply);
+	err = npunwa_transact(sc, op, sub, port, pl, npl, reply, nreply);
 	sc->busy = 0;
 	wakeup(&sc->busy);
 
 	return (err);
+}
+
+/* The common case: one payload word. */
+static int
+npunwa_command(struct npunwa_softc *sc, uint32_t op, uint32_t sub, uint32_t port,
+    uint32_t payload, uint32_t *reply, int nreply)
+{
+
+	return (npunwa_command_n(sc, op, sub, port, &payload, 1, reply, nreply));
 }
 
 /* Set a port's administrative state. This is the one that lights the LED. */
@@ -384,6 +395,64 @@ npunwa_port_get(struct npunwa_softc *sc, int n, uint32_t sub, uint32_t *out)
 }
 
 /*
+ * Tell the switch which address belongs to this port, which is the whole reason unicast works.
+ *
+ * The coprocessor's switch is a Marvell 88E6193X and UMSD sets its TCAM up with exactly two live
+ * entries: entry 0 matches broadcast and sends it to the CPU port, and entry 254 matches
+ * everything else with dpvMode OVERRIDE_DPV and a destination port vector of zero, which is a
+ * drop. The vendor's own comment in umsd says so plainly - "On this stage, only Broadcast mode is
+ * enabled, for other packets TCAM HIT will be only on Drop entry, which drops the packet".
+ *
+ * Every other entry is initialised DEAD on purpose. The per-port "this is my address" entry is
+ * written with its octet mask at 0x00, which that file's own table defines as "Never Hit. Used to
+ * prevent a TCAM hit from occurring from this entry", and the comment beside it says the mask will
+ * be changed to 0xff when a MAC arrives. The promiscuous entry and the twenty-four unicast and
+ * multicast filter entries are dead in the same way.
+ *
+ * So the switch drops every unicast frame until the host names the port's address, and that is
+ * measurable rather than argued: thirty unicast frames sent between two front ports over a patch
+ * cable arrived zero times, to the port's own address and to an address nobody owned, while
+ * broadcast arrived normally and the fastpath's drop counters stayed at zero throughout - because
+ * the frame never reached the fastpath at all.
+ *
+ * It is not the forwarding database. UMSD flushes the whole ATU at init and then disables learning
+ * on every port by zeroing the Port Association Vector, so there are no entries to look anything
+ * up in. An earlier guess that the switch was forwarding these frames to the trunk was wrong.
+ *
+ * The vendor's Linux host does send this, as nwa_port_mac_set in its pport_hw_ops. This driver
+ * never did, which is why it could transmit perfectly and receive only broadcast.
+ *
+ * The address is the one the interface already has; npugiu owns the ifnets and the same value
+ * already goes to the fastpath's logical-interface table, so nothing new is invented here.
+ *
+ * Layout confirmed byte for byte against a captured message from the appliance's own firmware:
+ * op 3, attr 3, port 0x8100, and the address as six raw bytes in transmission order starting at
+ * the payload offset - so the first payload word holds octets 0 to 3 and the second holds 4 and
+ * 5. Written out with this project's documentation prefix, 02:00:00:aa:bb:cc becomes payload
+ * words 0xaa000002 and 0x0000ccbb.
+ *
+ * The capture itself used the appliance's own base address, which is not reproduced here: a real
+ * hardware identifier belonging to the machine this runs on has no business in a public tree, and
+ * tools/check-private-data.py is what caught it being put there.
+ */
+static int
+npunwa_port_set_mac(struct npunwa_softc *sc, int n)
+{
+	uint8_t mac[6];
+	uint32_t pl[2];
+
+	if (npugiu_front_mac(n, mac) != 0)
+		return (ENXIO);
+
+	pl[0] = (uint32_t)mac[0] | ((uint32_t)mac[1] << 8) |
+	    ((uint32_t)mac[2] << 16) | ((uint32_t)mac[3] << 24);
+	pl[1] = (uint32_t)mac[4] | ((uint32_t)mac[5] << 8);
+
+	return (npunwa_command_n(sc, NWA_OP_SET, NWA_SUB_MAC,
+	    npuep_front_ports[n].tag, pl, 2, NULL, 0));
+}
+
+/*
  * Bring every port we know about up, and read back what came of it. A port that refuses is
  * reported and skipped: one dead port is not a reason to leave the other nine dark.
  */
@@ -391,7 +460,7 @@ static void
 npunwa_bring_up(struct npunwa_softc *sc)
 {
 	uint32_t v;
-	int n, up = 0, linked = 0;
+	int n, up = 0, linked = 0, addressed = 0;
 
 	mtx_assert(&sc->mtx, MA_OWNED);
 
@@ -420,6 +489,18 @@ npunwa_bring_up(struct npunwa_softc *sc)
 		p->up = 1;
 		up++;
 
+		/*
+		 * And name its address, without which the switch drops every unicast frame the
+		 * port receives. A port that refuses is still up and still carries broadcast, so
+		 * this is reported and not fatal.
+		 */
+		if (npunwa_port_set_mac(sc, n) != 0)
+			device_printf(sc->fac.dev,
+			    "nwa: %s would not take its own address - it will "
+			    "receive broadcast only\n", npuep_front_ports[n].label);
+		else
+			addressed++;
+
 		if (npunwa_port_get(sc, n, NWA_SUB_STATE, &v) == 0) {
 			p->link = (int)v;
 			if (v != 0)
@@ -435,8 +516,8 @@ npunwa_bring_up(struct npunwa_softc *sc)
 	 * exactly what the first version did, and it looked like a fault. The link poll below says
 	 * what is actually connected, a moment later.
 	 */
-	device_printf(sc->fac.dev, "nwa: %d of %d ports up\n",
-	    up, NPUEP_NFRONT);
+	device_printf(sc->fac.dev, "nwa: %d of %d ports up, %d told their own address\n",
+	    up, NPUEP_NFRONT, addressed);
 	(void)linked;
 }
 
