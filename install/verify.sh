@@ -103,19 +103,43 @@ elif [ "$n" -gt 0 ]; then
 else
     bad "no npup interfaces at all"
     # The most common cause, and the one nobody guesses.
-    if dmesg | grep -q "answers HOST_MGMT_READY once per coprocessor boot"; then
+    if saw "answers HOST_MGMT_READY once per coprocessor boot"; then
         bad "the datapath refused a second bring-up - the coprocessor has to restart. sh contrib/npuep/reload.sh pulses its reset line and waits for it, which is verified to bring all fourteen back"
     fi
 fi
 
-if dmesg | grep -q "read back and confirmed"; then
+# Evidence from the boot, which ages out.
+#
+# The next few facts are printed once each, at attach. dmesg's ring buffer is finite, so on a box
+# that has been up for days they will have scrolled away - and a check that reads "it never
+# happened" off a wrapped buffer reports a healthy machine as broken. So look in dmesg, then in
+# what syslog kept, and if the buffer has clearly wrapped say that instead of failing.
+saw() {
+    dmesg 2>/dev/null | grep -q -- "$1" && return 0
+    grep -qs -- "$1" /var/log/system/latest.log && return 0
+    return 1
+}
+# The driver's first attach line. If even that is gone, nothing from the boot is left to read.
+aged_out() {
+    dmesg 2>/dev/null | grep -q "barmap version" && return 1
+    return 0
+}
+
+if saw "read back and confirmed"; then
     ok "the coprocessor's interface table was programmed and read back"
+elif aged_out; then
+    note "cannot tell whether the interface table was confirmed - the boot messages have aged out"
 else
     bad "the interface table was never confirmed - received frames will be dropped before they are counted"
 fi
 
-up=$(dmesg | grep -c "nwa: 14 of 14 ports up")
-if [ "$up" -gt 0 ]; then ok "all fourteen ports were commanded up"; else note "the network agent did not report 14 of 14 ports up"; fi
+if saw "nwa: 14 of 14 ports up"; then
+    ok "all fourteen ports were commanded up"
+elif aged_out; then
+    note "cannot tell whether all fourteen ports were commanded up - the boot messages have aged out"
+else
+    note "the network agent did not report 14 of 14 ports up"
+fi
 
 echo
 echo "== thermal, because this board has nothing else watching =="

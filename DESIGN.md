@@ -255,10 +255,44 @@ an unrelated subsystem, some minutes later, with no device errors logged in betw
 that prevents it had been written, carefully, and left reachable only from a path that a reboot
 never takes.
 
-The quiescing half of detach is now a function of its own - withdraw the facilities newest first,
-stop the heartbeat, clear `HOST_INIT` and `HOST_ALIVE`, disable bus mastering - and `device_detach`
-and `device_shutdown` both call it. Detach goes on to hand the resources back. Shutdown does not,
-because the machine is about to stop caring about them.
+### And the obvious fix hung the machine
+
+The first attempt made the quiescing half of detach a function of its own and had both
+`device_detach` and `device_shutdown` call it: withdraw the facilities newest first, drain the
+heartbeat, clear `HOST_INIT` and `HOST_ALIVE`, disable bus mastering. It reads correctly. The first
+reboot after it went in never came back.
+
+```
+06:16:43  reboot: rebooted by root
+06:16:43  syslog-ng: syslog-ng shutting down
+          ... thirty minutes of nothing ...
+06:47:00  kernel: ---<<BOOT>>---        <- and kern.boottime is the power cycle
+```
+
+No `---<<BOOT>>---` in between, and the boot time afterwards is when the power was pulled. The
+machine entered shutdown and never reached the reset.
+
+**Every one of those withdrawals waits.** They wait for a coprocessor to acknowledge, and they
+drain taskqueue threads. That is correct in `kldunload`, where the system is running underneath
+them. Device shutdown methods run late in `kern_reboot`, after the filesystems have been flushed,
+and waiting on anything there is a request to be hung.
+
+So `device_shutdown` now does only what actually stops the endpoint writing into host memory, and
+only in register writes that return:
+
+- clear `HOST_INIT` and `HOST_ALIVE`, so the far side is told;
+- clear the **bus master** bit, so it is stopped whether or not it was listening. Every DMA write
+  and every MSI-X message is a memory write from the endpoint, so this covers the interrupts too -
+  and it is enforced by the root complex rather than by the coprocessor's cooperation, which is why
+  it is the one step that matters.
+
+`callout_stop` rather than `callout_drain`, because stop does not wait for a callout already
+running and the heartbeat's whole job is one register write that is harmless at that point. The
+facility teardown stays in `device_detach`, where there is a system to wait on.
+
+The general lesson is not about this driver. A teardown written for module unload is not a shutdown
+handler, however similar the two look, and the difference does not show up in review - it shows up
+as a machine that goes quiet and never comes back.
 
 ## Which kernel sources the module is built against
 
