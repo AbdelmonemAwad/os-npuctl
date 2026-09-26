@@ -101,7 +101,7 @@ kldstat -q -m hidraw || kldload hidraw 2>/dev/null || true
 
 echo
 echo "== installed =="
-echo "   Both hooks run at the next boot: 01 releases the NPU from reset, 02 loads the driver"
+echo "   Both hooks run at the next boot: 06 releases the NPU from reset, 07 loads the driver"
 echo "   and waits for the front ports so that OPNsense's interface configuration can see them."
 echo
 echo "   To release the NPU now, without rebooting:"
