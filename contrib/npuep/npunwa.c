@@ -454,6 +454,44 @@ npunwa_port_set_mac(struct npunwa_softc *sc, int n)
 }
 
 /*
+ * Open or close the switch's catch-all for one front port.
+ *
+ * npunwa_port_set_mac arms the per-port "this is my address" TCAM entry, which is what an ordinary
+ * interface wants: the switch then delivers unicast addressed to that port and drops the rest. A
+ * BRIDGE wants the opposite. Its whole function is to receive frames addressed to other machines
+ * and forward them, so a bridged port that only accepts its own address forwards nothing but
+ * broadcast - and looks like it is half working, which is the worst way for this to fail.
+ *
+ * UMSD's TCAM entry 1 is the catch-all, and it is written dead: its source-port vector mask is
+ * 0x7FF, so it can never match. umsd_port_promisc_set arms it by clearing that port's bit in the
+ * mask. This attribute is what reaches that code.
+ *
+ * This sleeps - npunwa_command waits for the mailbox - so it is exported for npugiu to call from
+ * its ioctl path with no lock held, never from the datapath.
+ */
+int
+npunwa_set_promisc(int idx, int on)
+{
+	struct npunwa_softc *sc = npunwa_sc;
+	int err;
+
+	if (sc == NULL || idx < 0 || idx >= NPUEP_NFRONT)
+		return (ENXIO);
+
+	mtx_lock(&sc->mtx);
+	err = npunwa_command(sc, NWA_OP_SET, NWA_SUB_PROMISC,
+	    npuep_front_ports[idx].tag, on ? 1 : 0, NULL, 0);
+	mtx_unlock(&sc->mtx);
+
+	if (err != 0)
+		device_printf(sc->fac.dev,
+		    "nwa: %s would not %s its catch-all (%d) - a bridge on this port will "
+		    "forward broadcast only\n", npuep_front_ports[idx].label,
+		    on ? "open" : "close", err);
+	return (err);
+}
+
+/*
  * Bring every port we know about up, and read back what came of it. A port that refuses is
  * reported and skipped: one dead port is not a reason to leave the other nine dark.
  */

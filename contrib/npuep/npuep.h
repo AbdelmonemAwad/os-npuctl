@@ -277,6 +277,14 @@ int	npugiu_front_mac(int idx, uint8_t *out);
  * and the interfaces belong to the giu facility, so this is the seam between them.
  */
 void	npugiu_link_change(int idx, int up, int speed);
+/*
+ * Open or close a front port's catch-all in the switch. A bridge member needs this: its job is to
+ * receive frames addressed to somebody else, and without it the switch delivers only what is
+ * addressed to that port itself.
+ *
+ * Sleeps. The caller must hold no driver lock.
+ */
+int	npunwa_set_promisc(int idx, int on);
 
 int	npurpc_attach(struct npuep_facility *fac);
 void	npurpc_detach(void);
