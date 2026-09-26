@@ -61,17 +61,44 @@ its own cannot be answered.** Three remedies were tried and measured not to help
 handshake; and waiting thirty seconds instead of four.
 
 What restores it is a coprocessor reboot, and the host owns the means: `01-npuctl` pulses the
-reset line, and the pulse is a reset rather than a release. A cold power cycle is verified to
-restore everything. A warm reboot runs that same hook, so it probably does too - **untested**, and
-this file previously stated the stronger claim without evidence. Narrow the claim before designing
-around it.
+reset line, and the pulse is a reset rather than a release. **Verified: a pulse followed by a
+reload brings back all fourteen interfaces, the forwarding tables and the network agent, with no
+power cycle** - `nwa: 14 of 14 ports up`, and a front port brought up with no address counted
+forty frames off the wire in twelve seconds. A cold power cycle is verified too. A warm reboot
+runs that same hook, so it very probably works as well - still **untested** as a whole, though the
+mechanism it would rely on no longer is.
+
+This file used to say a power cycle was the only thing that worked. That was wrong, and it was
+wrong for a reason worth keeping, because both causes looked exactly like hardware:
+
+- `reload.sh` parsed the PCI selector with `awk -F'[@ ]'`, and `pciconf -l` separates the selector
+  from the class with a **tab**. So the selector came out as `pci0:1:0:0:<tab>class=0x020000`,
+  every probe failed to parse, the script waited its full ninety seconds and reported a dead
+  endpoint that had been answering from the first second.
+- The barmap parser read an entry the coprocessor had not written yet as a real one. All four
+  fields are zero in an unwritten entry, and zero is `MV_FACILITY_CONTROL`, so a half-published
+  table came back as "control facility is not on BAR2" and failed attach outright.
+
+**The facility table is published about fourteen seconds after a reset, and not atomically.**
+Measured here: the cookie reads zero for thirteen seconds, the entries then appear in order, and
+the table is complete at fourteen. The cookie is not a commit - it is in place before the entries
+are - so `npuep_wait_barmap` polls for the facilities it needs rather than for the cookie, up to
+two minutes, and goes on with whatever is published if it runs out.
+
+That timing is also why none of this showed at boot: `01-npuctl` pulses reset there too, but a
+minute of other boot work happens before the module loads, so the table is long finished. The
+defect was invisible on the only path that was ever run.
 
 **Loading the driver while the endpoint is in reset hangs the host.** Measured: a reset pulse, a
 forty-five second wait and a `kldload` stopped the machine dead - no panic, no console output,
-nothing. A PCIe read to an endpoint in reset neither completes nor times out. Nothing in the
-driver checks that the device is alive before its first read; it waits for `DEV_READY` only after
-reading the barmap. That is a hazard at every boot, and fixing it is what would make a
-pulse-then-reload cycle safe.
+nothing. A PCIe read to an endpoint in reset neither completes nor times out.
+
+Guarded in two places now. Attach asks **config space** whether the device answers before it reads
+any memory, which is the safe question: a configuration read to a device that is not answering is
+completed by the root complex as all-ones rather than left outstanding, so it returns instead of
+stopping the machine. `reload.sh` asks the same question before it loads. Measured after the fix,
+the endpoint answers config space immediately after a pulse - so the guard costs nothing on the
+path that works, and only the facility table needs waiting for.
 
 **Programming the forwarding tables races the coprocessor's own startup.** Its userspace fastpath
 starts in response to this host's handshake and zeroes the whole logical-interface table about
