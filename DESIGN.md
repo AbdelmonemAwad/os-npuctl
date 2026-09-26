@@ -411,8 +411,11 @@ kernel would have - `20000000 / megabits` - reads what is there, and writes only
 Three decisions in it are worth stating, because each is a thing deliberately not done:
 
 - **Dark ports are left alone.** Setting a cost sets `BSTP_PORT_ADMCOST`, which tells RSTP never to
-  compute one again, so pinning a guess for a port with no cable would outlast the guess. It keeps
-  the neutral 55 until a cable arrives.
+  compute one again, so pinning a guess for a port with no cable would outlast the guess. A port
+  that has never had carrier therefore sits at 55; one that had carrier and lost it keeps whatever
+  was latched then, which on this bench was a port briefly cabled and left at 2000000. Neither
+  matters: RSTP gives a member with no carrier `role disabled` and does not consult its cost, and a
+  cable returning brings the right figure within a minute.
 - **Only this driver's ports.** Every other NIC on this appliance reports its speed before OPNsense
   gets round to bridging it, so the figure FreeBSD worked out is already right and meddling would
   be worse.
