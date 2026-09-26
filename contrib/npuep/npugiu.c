@@ -212,6 +212,8 @@ struct npugiu_port {
 	struct ifmedia		 media;
 	int			 link;		/* -1 unknown, 0 down, 1 up */
 	int			 speed;		/* megabits, 0 if not known */
+	int			 index;		/* into npuep_front_ports, for the nwa seam */
+	int			 promisc;	/* what the switch was last told */
 };
 
 struct npugiu_softc {
@@ -1081,12 +1083,29 @@ npugiu_ioctl(if_t ifp, u_long cmd, caddr_t data)
 	int err = 0;
 
 	switch (cmd) {
-	case SIOCSIFFLAGS:
+	case SIOCSIFFLAGS: {
+		int want;
+
 		GIU_LOCK(pt->sc);
 		if ((if_getflags(ifp) & IFF_UP) != 0)
 			npugiu_init_locked(pt);
 		GIU_UNLOCK(pt->sc);
+
+		/*
+		 * Promiscuous mode is not ours to implement - it belongs to the switch in front of
+		 * these ports, which drops any unicast it has not been told this port owns. if_bridge
+		 * sets IFF_PROMISC on every member for exactly the reason it matters here, so a
+		 * bridge over front ports forwards nothing but broadcast until this is passed on.
+		 *
+		 * OUTSIDE the lock, deliberately. npunwa_set_promisc waits on the agent's mailbox and
+		 * sleeps, and this driver has already panicked once on sleeping under this mutex.
+		 * An ioctl runs in a process context, so sleeping here is fine; sleeping there is not.
+		 */
+		want = (if_getflags(ifp) & (IFF_PROMISC | IFF_PPROMISC)) != 0;
+		if (want != pt->promisc && npunwa_set_promisc(pt->index, want) == 0)
+			pt->promisc = want;
 		break;
+	}
 	case SIOCSIFMTU:
 		/*
 		 * Anything the device's own buffers can hold.
@@ -1158,6 +1177,8 @@ npugiu_attach_ifnet(struct npugiu_softc *sc)
 
 		pt->sc = sc;
 		pt->fp = fp;
+		pt->index = i;
+		pt->promisc = 0;
 		memcpy(pt->mac, sc->hostmac, sizeof(pt->mac));
 		pt->mac[5] = (uint8_t)(sc->hostmac[5] + fp->unit);
 

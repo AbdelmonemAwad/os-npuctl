@@ -285,16 +285,54 @@ something. Verified with a temporary printf: indices 0, 2, 3 and 8 - exactly the
 This is not cosmetic. OPNsense drives gateway monitoring, failover and its `rc.linkup` hooks off
 link state, and a port that is always up is a port those mechanisms are blind to.
 
-#### Still open: there is no media layer
+#### The media layer, and what it finally made visible
 
-`ifconfig` prints its `status:` line from `SIOCGIFMEDIA`, and this driver answers no media ioctl at
-all - so there is no `status: active` or `status: no carrier` on any of the fourteen, and no speed
-shown either. That is a separate gap from link state and it wants `ifmedia(9)`.
+`ifconfig` prints both its `status:` line and its `media:` line from `SIOCGIFMEDIA`, and this
+driver answered no media ioctl at all - so for most of the project's life none of the fourteen
+showed a status or a speed, and OPNsense's interface list had nothing to colour a plug icon from.
 
-Two hours went into chasing the wrong indicator first. `ifconfig` shows `0x1000000` on the USB
-adapters, and it is tempting to read that as a link flag; it is `IFF_NETLINK_1`, "used by netlink".
-**FreeBSD has no `IFF_LOWER_UP`** - that is a Linux flag - and link state is not visible in the
-flags word at all.
+With `ifmedia(9)` in place:
+
+```
+npup4   0x1008843  UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST,LOWER_UP    status: active
+npup2   0x8802     BROADCAST,SIMPLEX,MULTICAST                        status: no carrier
+```
+
+Only `IFM_AUTO` is offered and the change callback does nothing but succeed: the coprocessor
+negotiates and the host is not in that conversation, so a menu of forced speeds it would ignore
+would be a lie with a menu. The speed is read only while carrier is up, because the ten switch
+ports answer with their capability rather than with nothing when they are dark.
+
+**A correction.** An earlier version of this section said that FreeBSD has no `IFF_LOWER_UP`, that
+it is a Linux flag, and that link state is not visible in the flags word at all. The first part is
+half true and the rest is wrong. `0x1000000` is indeed `IFF_NETLINK_1` in this kernel's `if.h` -
+but it is set when the interface has carrier, and `ifconfig` prints it as `LOWER_UP`, as the two
+lines above show. Two hours went into chasing that indicator and concluding it meant nothing; it
+meant something, and the reason it was absent was that nothing in the driver was reporting
+carrier yet.
+
+#### Promiscuous mode belongs to the switch
+
+Arming each port's "this is my address" entry is what an ordinary interface wants: the switch
+delivers unicast addressed to that port and drops the rest.
+
+A **bridge** wants the opposite. Its function is to receive frames addressed to other machines and
+forward them, so a bridged front port that only accepts its own address forwards nothing but
+broadcast - and looks like it is half working, which is the worst way for this to fail.
+
+UMSD's TCAM entry 1 is the catch-all and is written dead, with a source-port vector mask of
+`0x7FF` that can never match; `umsd_port_promisc_set` arms it by clearing that port's bit.
+`NWA_SUB_PROMISC` (0x45) is what reaches that code, and `if_bridge` setting `IFF_PROMISC` on a
+member is what reaches this driver. Measured on the 3-4 loopback, with frames addressed to a MAC
+the receiving port does not own:
+
+```
+before promiscuous   0 of 20 arrived
+after  promiscuous  20 of 20 arrived
+```
+
+It is sent from the ioctl path with **no driver lock held**, because the agent's mailbox sleeps and
+this driver has already panicked once on sleeping under that mutex.
 
 ## Why the module is not loaded automatically
 

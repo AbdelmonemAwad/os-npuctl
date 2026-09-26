@@ -72,6 +72,39 @@ Only thirty-nine bytes in the whole 64 KB change during port activity, all of th
 The MAC is the strongest evidence in the whole exercise: every port toggled produced an
 `op=03 sub=03` carrying that port's own hardware address and no other's.
 
+Note that `0x45` appears in both columns and means two unrelated things: as an **op** it is the
+periodic status message the coprocessor sends unprompted, and as a **sub** it is the promiscuous
+attribute described below. The two spaces are separate and the collision is a coincidence.
+
+### The attributes this driver drives
+
+These are the ones sent deliberately, rather than watched. Each was confirmed by a `status = 0`
+reply and by the behaviour changing on the wire.
+
+| sub | name | what it does |
+|---|---|---|
+| `0x00` | state | administrative up and down |
+| `0x01` | oper state | read-only; what the port is actually doing |
+| `0x02` | MTU | bytes |
+| `0x03` | MAC | sets the port's own address **and arms the switch to accept unicast for it** |
+| `0x04` | speed | megabits; only meaningful while carrier is up |
+| `0x45` | promiscuous | opens the switch's catch-all for this port |
+| `0x46` | all-multicast | not driven; named for completeness |
+
+Two of them reach the switch rather than the port, and that is the part worth knowing.
+
+**`0x03` is not only cosmetic.** The switch drops every unicast frame whose destination it has not
+been told belongs to that port, so until the address is sent the port receives broadcast and
+nothing else - which looks like a working port until something tries to talk to it directly.
+
+**`0x45` is what a bridge needs.** A bridge's function is to receive frames addressed to other
+machines and forward them, so a bridged front port that accepts only its own address forwards
+broadcast and nothing else. Measured on a loopback between two front ports, with frames addressed
+to an address the receiving port does not own: 0 of 20 arrived before, 20 of 20 after.
+
+It sleeps - the mailbox is a round trip - so it is sent from the ioctl path with no driver lock
+held, never from the datapath.
+
 ## The port identifiers
 
 **`port_id = 0x8000 + N * 0x100`** for the switch ports, confirmed one port at a time:

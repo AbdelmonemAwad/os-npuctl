@@ -107,6 +107,8 @@
 #define	NWA_SUB_MAC		0x03
 #define	NWA_SUB_SPEED		0x04	/* capability, 1000 on every port including dark ones */
 #define	NWA_SUB_MEDIA		0x0a	/* 3 on a fibre port, 0 on copper */
+#define	NWA_SUB_PROMISC		0x45	/* set: 1 opens the port's TCAM catch-all, 0 closes it */
+#define	NWA_SUB_ALLMULTI	0x46
 #define	NWA_SUB_MCAST		0x4a
 
 /*
