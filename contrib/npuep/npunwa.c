@@ -467,6 +467,13 @@ npunwa_link_step(struct npunwa_softc *sc)
 			    p->media == 3 ? "fibre" : "copper",
 			    link ? "carrier up" : "carrier down");
 			p->link = link;
+			/*
+			 * And tell the stack, which is the whole point of knowing. Printing it to
+			 * the log told a human and left ifconfig, OPNsense's interface list, its
+			 * gateway monitoring and its rc.linkup hooks all believing every port was
+			 * up for ever.
+			 */
+			npugiu_link_change(n, link);
 		}
 	}
 

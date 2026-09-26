@@ -964,7 +964,20 @@ npugiu_init_locked(struct npugiu_port *pt)
 		return;
 
 	if_setdrvflagbits(pt->ifp, IFF_DRV_RUNNING, IFF_DRV_OACTIVE);
-	if_link_state_change(pt->ifp, LINK_STATE_UP);
+
+	/*
+	 * Deliberately NOT if_link_state_change(LINK_STATE_UP) here.
+	 *
+	 * This facility moves frames; it has no idea whether a cable is in the socket. Declaring
+	 * every port up because the datapath came up is how all fourteen showed a green plug in
+	 * the OPNsense interface list from the moment the driver loaded, including the ten with
+	 * nothing plugged into them. That is not a cosmetic complaint: OPNsense drives gateway
+	 * monitoring, failover and its rc.linkup hooks off link state, and a port that is always
+	 * up is a port those mechanisms are blind to.
+	 *
+	 * The network agent is the one thing that knows, and it calls npugiu_link_change below.
+	 * Until it does the state stays LINK_STATE_UNKNOWN, which is the honest answer.
+	 */
 }
 
 /*
@@ -1106,6 +1119,26 @@ npugiu_front_mac(int idx, uint8_t *out)
 		return (ENXIO);
 	memcpy(out, sc->port[idx].mac, 6);
 	return (0);
+}
+
+/*
+ * Carrier, from the only facility that can see it.
+ *
+ * Called from the network agent's link poll, which holds its own lock and never holds this one -
+ * and this facility never calls into the agent, so the two cannot deadlock against each other.
+ * No lock is taken here for the same reason npugiu_front_mac takes none: an ifp is published once
+ * at attach and cleared once at detach, and if_link_state_change is written to be callable from
+ * an interrupt handler.
+ */
+void
+npugiu_link_change(int idx, int up)
+{
+	struct npugiu_softc *sc = npugiu_sc;
+
+	if (sc == NULL || idx < 0 || idx >= NPUEP_NFRONT || sc->port[idx].ifp == NULL)
+		return;
+	if_link_state_change(sc->port[idx].ifp,
+	    up ? LINK_STATE_UP : LINK_STATE_DOWN);
 }
 
 static void
