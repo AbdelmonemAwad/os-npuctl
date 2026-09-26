@@ -1,3 +1,7 @@
+#-
+# SPDX-License-Identifier: BSD-2-Clause
+#
+
 PLUGIN_NAME=		npuctl
 PLUGIN_VERSION=		0.1
 PLUGIN_COMMENT=		Bring the Marvell NPU out of reset on Sophos XGS appliances

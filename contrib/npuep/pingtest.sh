@@ -1,4 +1,7 @@
 #!/bin/sh
+#-
+# SPDX-License-Identifier: BSD-2-Clause
+#
 # Can a packet cross? The coprocessor gives its end of the link fe80::0002.
 set -e
 ifconfig mvmgmt0 inet6 -ifdisabled || true

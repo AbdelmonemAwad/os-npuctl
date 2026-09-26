@@ -1,4 +1,7 @@
 #!/bin/sh
+#-
+# SPDX-License-Identifier: BSD-2-Clause
+#
 # Release the Marvell NPU from reset. Numbered 06, and the number is load-bearing in both
 # directions.
 #

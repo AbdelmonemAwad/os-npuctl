@@ -1,3 +1,7 @@
+#-
+# SPDX-License-Identifier: BSD-2-Clause
+#
+
 # Built on the appliance, against kernel sources unpacked into /usr/src:
 #
 #	make SYSDIR=/usr/src/sys

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+#-
+# SPDX-License-Identifier: BSD-2-Clause
+#
 """Keep Arabic out of the code. It belongs in the translation files and nowhere else.
 
 The rule is the owner's, and it is a good one for a project meant to be read by people

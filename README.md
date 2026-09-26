@@ -1,16 +1,28 @@
-# os-npuctl
+# os-xgs-npu
 
-Make the fourteen front ports of a Sophos XGS appliance work under OPNsense.
+**All fourteen front ports of a Sophos XGS 136, working under OPNsense.**
 
-These appliances are an x86 host with a Marvell CN913x coprocessor behind a PCIe endpoint, and
-**the coprocessor owns every front port**. Install a stock OPNsense on one and it boots to a
-working firewall with no network interfaces at all. The vendor's drivers are Linux-only, so the
-usual answer is that the hardware is e-waste.
+[![checks](https://github.com/AbdelmonemAwad/os-xgs-npu/actions/workflows/checks.yml/badge.svg)](https://github.com/AbdelmonemAwad/os-xgs-npu/actions/workflows/checks.yml)
+[![licence](https://img.shields.io/badge/licence-BSD--2--Clause-blue.svg)](LICENSE)
+[![OPNsense](https://img.shields.io/badge/OPNsense-26.7-d94f00.svg)](https://opnsense.org/)
+[![FreeBSD](https://img.shields.io/badge/FreeBSD-15.1--RELEASE--p1-ab2b28.svg)](https://www.freebsd.org/)
+[![front ports](https://img.shields.io/badge/front%20ports-14%2F14-brightgreen.svg)](#-what-works)
+[![tested on](https://img.shields.io/badge/tested%20on-XGS%20136%20(AMDA0201)-lightgrey.svg)](#%EF%B8%8F-hardware)
+
+This appliance looks like one computer and is two: an x86 host, and a Marvell CN9131 coprocessor
+behind a PCIe endpoint that **owns every front port**. Install a stock OPNsense on one and it
+boots to a working firewall with no network interfaces at all. The vendor's drivers are
+Linux-only, so the usual answer is that the hardware is e-waste.
 
 It is not. The coprocessor is a whole computer that boots its own Linux from its own eMMC, and it
 is sitting there waiting to be told a host is present.
 
-## What works
+> **Scope.** Everything here was written and measured on **one appliance**, a Sophos XGS 136
+> (assembly AMDA0201, CN9131, 14 ports). Values for sibling assemblies are carried in the tree
+> because they were read out of the vendor's own tables, and they are marked as untested wherever
+> they appear. No other model has been on the bench.
+
+## ✅ What works
 
 **All fourteen front ports carry traffic, in both directions, as fourteen ordinary FreeBSD
 interfaces.**
@@ -68,7 +80,7 @@ have arrived on `npup11` instead of `npup9`. It arrived on `npup9`.
 The driver loads itself at boot, creates the interfaces, programs the coprocessor and verifies the
 programming by reading it back. Nothing is typed.
 
-## How it works, briefly
+## 🧭 How it works, briefly
 
 The coprocessor publishes a map of five *facilities* in a PCIe BAR, each one a different
 conversation:
@@ -91,7 +103,7 @@ Receive needs the coprocessor's own forwarding tables filled in, which is what t
 is for: a logical interface per port, and a binding from the port tag to it. Two commands each,
 and nothing else.
 
-## What it cannot do
+## ⚠️ What it cannot do
 
 **The datapath attaches once per coprocessor boot.** The device waits for `HOST_MGMT_READY`
 once, answers once, and then spends the rest of its life in its command loop. **A module reload on
@@ -137,7 +149,7 @@ is the GIU port's own, is not implemented by this firmware at all. The driver re
 counts and says so plainly, because an instrument that prints a zero reading like a measurement is
 worse than one that admits it cannot see.
 
-## Hardware
+## 🖥️ Hardware
 
 Written and measured on a **Sophos XGS 136** (assembly AMDA0201, CN9131, 14 ports) running
 OPNsense 26.7 on FreeBSD 15.1.
@@ -148,11 +160,11 @@ up. Values are carried for AMDA0200, AMDA0201 (XGS 126/136), AMDA0202-0205, AMDA
 and AMDA0224 (XGS 138). **Only AMDA0201 has been tested on real hardware.** The others come from
 the vendor tool and should be treated as unverified.
 
-## Installing
+## 📦 Installing
 
 ```sh
-git clone https://github.com/AbdelmonemAwad/os-npuctl
-cd os-npuctl
+git clone https://github.com/AbdelmonemAwad/os-xgs-npu
+cd os-xgs-npu
 ./install/install.sh
 ```
 
@@ -189,19 +201,38 @@ hardware needs only happens on the `kldload` path. See
 Both hooks are written so that they can never be the reason a firewall fails to boot: unfamiliar
 hardware, a missing module or a coprocessor that never answers each log the reason and exit 0.
 
-## Documentation
+## 📚 Documentation
 
-[DESIGN.md](DESIGN.md) is the contract. The `docs/` directory is the protocol work — what each
-facility is, how it was read, and which claims are measured rather than inferred.
+[**DESIGN.md**](DESIGN.md) is the contract — the stages, the limits that are properties of the
+hardware, and every claim that turned out to be wrong, with what replaced it.
+
+| | |
+|---|---|
+| [hardware.md](docs/hardware.md) | What is actually on the board, measured |
+| [npu-bring-up.md](docs/npu-bring-up.md) | Getting the coprocessor out of reset, over a USB-to-SPI bridge |
+| [facility-protocol.md](docs/facility-protocol.md) | The five facilities, the barmap, the handshake |
+| [mvmgmt.md](docs/mvmgmt.md) | `mvmgmt0`, the management interface |
+| [giu.md](docs/giu.md) | The datapath that carries all fourteen ports, and the 66-byte header |
+| [rpc.md](docs/rpc.md) | The control channel and the forwarding tables |
+| [netagent.md](docs/netagent.md) | Per-port state, link, media and address |
+| [porting-notes.md](docs/porting-notes.md) | What a port to another OS would hit |
+| [provenance.md](docs/provenance.md) | What was read, from where, and what was deliberately not copied |
 
 Much of it was recovered from Sophos's own shipped binaries, which carry full debug information,
 and from Marvell's GPL source drop. Where a claim comes from a disassembly it says so; where it
-comes from the vendor's own boot log it quotes the line.
+comes from the vendor's own boot log it quotes the line. **Where something is inferred rather than
+measured, it says that too** — several things in this file were once stated with more confidence
+than the evidence carried, and the corrections are in the history.
 
-## Licence
+## ⚖️ Licence
 
-BSD-2-Clause, except that the protocol it speaks was recovered from Marvell's GPL-2.0-only
-`pcie_ep_armada` driver, published by Sophos in its SFOS_OSS source ISO. No vendor code is
-included or redistributed here; `docs/` records what the protocol is, and the implementation is
-original. If you intend to reuse this, read
-[docs/facility-protocol.md](docs/facility-protocol.md) first and form your own view.
+**BSD-2-Clause.** Every file carries the identifier; [LICENSE](LICENSE) is the whole of it.
+
+The protocol it speaks was recovered from Marvell's GPL-2.0-only sources, published by Sophos in
+its SFOS_OSS drop, and from binaries the appliance ships. **No vendor code is included or
+redistributed here.** Facts — offsets, command numbers, field widths — are transcribed; expression
+is not copied, and `contrib/npuep/npugiu.h` is where that decision is visible and argued.
+
+[**docs/provenance.md**](docs/provenance.md) sets out exactly what was read, from where, which four
+sentences are quoted verbatim and why, and what is deliberately absent. Read it before reusing
+this, and form your own view.

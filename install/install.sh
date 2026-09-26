@@ -1,4 +1,7 @@
 #!/bin/sh
+#-
+# SPDX-License-Identifier: BSD-2-Clause
+#
 # Install from a copy of this repository, without pkg(8).
 #
 # This installs the RESET HOOK and the TOOLS. It does not build or load the kernel module - see

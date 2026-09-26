@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+#-
+# SPDX-License-Identifier: BSD-2-Clause
+#
 """Refuse to publish anything that carries the author's own network or a secret.
 
 These plugins are written on a live firewall, and that is their strength: everything in

@@ -1,4 +1,7 @@
 #!/bin/sh
+#-
+# SPDX-License-Identifier: BSD-2-Clause
+#
 # Reset the coprocessor, swap the module, and report. Run: sh /root/npu/kmod/reload.sh
 #
 # The reset before unloading is not tidiness. Once the management interface has published ring

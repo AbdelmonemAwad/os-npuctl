@@ -1,4 +1,7 @@
 #!/bin/sh
+#-
+# SPDX-License-Identifier: BSD-2-Clause
+#
 # Load the NPU endpoint driver, and wait for its interfaces before OPNsense configures them.
 #
 # Numbered 07 so it runs after 06-npuctl, and the order is not a preference: 06 is what pulses the

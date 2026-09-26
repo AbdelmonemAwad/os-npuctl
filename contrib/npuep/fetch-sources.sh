@@ -1,4 +1,7 @@
 #!/bin/sh
+#-
+# SPDX-License-Identifier: BSD-2-Clause
+#
 # Fetch the kernel sources that match THIS running kernel, and print the SYSDIR to build against.
 #
 #	sh contrib/npuep/fetch-sources.sh

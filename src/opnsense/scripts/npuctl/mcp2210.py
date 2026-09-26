@@ -1,4 +1,7 @@
 #!/usr/local/bin/python3
+#-
+# SPDX-License-Identifier: BSD-2-Clause
+#
 """
 Talk to the XGS 136's MCP2210 USB-to-SPI bridge from FreeBSD, the way Sophos does.
 

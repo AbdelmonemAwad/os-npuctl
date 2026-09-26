@@ -1,4 +1,7 @@
 #!/bin/sh
+#-
+# SPDX-License-Identifier: BSD-2-Clause
+#
 # Map every front port to the connector it really is, by transmitting out of each one and seeing
 # which one hears it. Run with loopback cables between pairs of front ports:
 #
