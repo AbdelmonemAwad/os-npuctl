@@ -276,7 +276,7 @@ int	npugiu_front_mac(int idx, uint8_t *out);
  * Tell the stack a front port's carrier changed. The network agent is the only thing that knows,
  * and the interfaces belong to the giu facility, so this is the seam between them.
  */
-void	npugiu_link_change(int idx, int up);
+void	npugiu_link_change(int idx, int up, int speed);
 
 int	npurpc_attach(struct npuep_facility *fac);
 void	npurpc_detach(void);

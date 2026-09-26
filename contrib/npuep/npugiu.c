@@ -60,6 +60,7 @@
 #include <sys/sockio.h>
 
 #include <net/if.h>
+#include <net/if_media.h>
 #include <net/if_var.h>
 #include <net/if_types.h>
 #include <net/ethernet.h>
@@ -204,6 +205,13 @@ struct npugiu_port {
 	if_t			 ifp;
 	const struct npuep_front_port *fp;
 	uint8_t			 mac[6];
+	/*
+	 * What the network agent last told us about the wire. -1 is "nobody has said yet", which
+	 * is not the same as down and is reported as such.
+	 */
+	struct ifmedia		 media;
+	int			 link;		/* -1 unknown, 0 down, 1 up */
+	int			 speed;		/* megabits, 0 if not known */
 };
 
 struct npugiu_softc {
@@ -998,6 +1006,73 @@ npugiu_ifinit(void *xsc)
 	GIU_UNLOCK(pt->sc);
 }
 
+/*
+ * The media layer, which is the only way ifconfig will print a speed or a status line.
+ *
+ * ifconfig reads both from SIOCGIFMEDIA. Without a media layer it prints neither, so for the
+ * whole life of this driver all fourteen ports showed no status: and no speed, and OPNsense's
+ * interface list had nothing to colour a plug icon from.
+ *
+ * Nothing here can CHANGE the media. The coprocessor negotiates, and the host is not in that
+ * conversation - so the only medium offered is IFM_AUTO and npugiu_media_change does nothing but
+ * succeed. Offering a list of forced speeds the device would ignore would be a lie with a menu.
+ */
+static int
+npugiu_media_change(if_t ifp __unused)
+{
+
+	return (0);
+}
+
+/*
+ * The speed, when it is worth believing.
+ *
+ * The two port families answer differently and it matters here. The four SoC ports report the
+ * speed they actually negotiated, and zero when the link is down. The ten behind the switch
+ * report their capability - a flat 1000 - whether or not anything is plugged in. So the figure is
+ * only used when carrier is up, which makes both families honest: a dark port shows no medium
+ * rather than a speed it is not running at.
+ *
+ * Capability, measured from the vendor's board database: connectors 11 and 12 are 2.5G and are
+ * also the two with Power over Ethernet; everything else on the front panel is 1G, including the
+ * two SFP cages, which the board configures for 1000BASE-X even though the switch silicon could
+ * do more.
+ */
+static int
+npugiu_media_word(struct npugiu_port *pt)
+{
+	int fibre = (pt->fp->label[4] == 'F');	/* PortF1 and PortF2 are the cages */
+
+	switch (pt->speed) {
+	case 10:
+		return (IFM_10_T);
+	case 100:
+		return (IFM_100_TX);
+	case 1000:
+		return (fibre ? IFM_1000_SX : IFM_1000_T);
+	case 2500:
+		return (IFM_2500_T);
+	default:
+		return (IFM_AUTO);
+	}
+}
+
+static void
+npugiu_media_status(if_t ifp, struct ifmediareq *ifmr)
+{
+	struct npugiu_port *pt = if_getsoftc(ifp);
+
+	ifmr->ifm_status = IFM_AVALID;
+	ifmr->ifm_active = IFM_ETHER;
+
+	if (pt == NULL || pt->link <= 0) {
+		ifmr->ifm_active |= IFM_NONE;
+		return;
+	}
+	ifmr->ifm_status |= IFM_ACTIVE;
+	ifmr->ifm_active |= npugiu_media_word(pt) | IFM_FDX;
+}
+
 static int
 npugiu_ioctl(if_t ifp, u_long cmd, caddr_t data)
 {
@@ -1037,6 +1112,10 @@ npugiu_ioctl(if_t ifp, u_long cmd, caddr_t data)
 	case SIOCDELMULTI:
 		/* Filtering is the switch's, not ours; nothing to program here. */
 		break;
+	case SIOCGIFMEDIA:
+	case SIOCSIFMEDIA:
+		err = ifmedia_ioctl(ifp, ifr, &pt->media, cmd);
+		break;
 	default:
 		err = ether_ioctl(ifp, cmd, data);
 		break;
@@ -1047,11 +1126,16 @@ npugiu_ioctl(if_t ifp, u_long cmd, caddr_t data)
 /*
  * One interface per front port, named for the number on the chassis.
  *
- * The addresses are this host's to choose - the coprocessor does not filter on them, because the
- * interfaces are configured in L2 mode where the destination-MAC check does not run - so they are
- * derived from the address the datapath already answers to, one per unit. Locally administered,
- * distinct, and stable across loads, which is what an operator assigning these in a firewall
- * needs more than it needs them to match the labels on the silicon.
+ * The addresses are this host's to choose, and they are derived from the address the datapath
+ * already answers to, one per unit. Locally administered, distinct, and stable across loads,
+ * which is what an operator assigning these in a firewall needs more than it needs them to match
+ * the labels on the silicon.
+ *
+ * They are NOT arbitrary, and an earlier version of this comment was wrong to say the coprocessor
+ * does not filter on them. It does: the switch in front of these ports drops every unicast frame
+ * whose destination it has not been told belongs to that port, and npunwa_port_set_mac is what
+ * tells it. Whatever is chosen here is what has to be sent there, which is why both come from
+ * npugiu_front_mac rather than from two places that could disagree.
  */
 static int
 npugiu_attach_ifnet(struct npugiu_softc *sc)
@@ -1090,6 +1174,12 @@ npugiu_attach_ifnet(struct npugiu_softc *sc)
 		if_setsendqlen(ifp, NPUGIU_DATA_Q_LEN - 1);
 		if_setsendqready(ifp);
 		if_setmtu(ifp, NPUGIU_MTU);
+
+		pt->link = -1;
+		pt->speed = 0;
+		ifmedia_init(&pt->media, 0, npugiu_media_change, npugiu_media_status);
+		ifmedia_add(&pt->media, IFM_ETHER | IFM_AUTO, 0, NULL);
+		ifmedia_set(&pt->media, IFM_ETHER | IFM_AUTO);
 		ether_ifattach(ifp, pt->mac);
 
 		GIU_LOCK(sc);
@@ -1131,12 +1221,16 @@ npugiu_front_mac(int idx, uint8_t *out)
  * an interrupt handler.
  */
 void
-npugiu_link_change(int idx, int up)
+npugiu_link_change(int idx, int up, int speed)
 {
 	struct npugiu_softc *sc = npugiu_sc;
 
 	if (sc == NULL || idx < 0 || idx >= NPUEP_NFRONT || sc->port[idx].ifp == NULL)
 		return;
+
+	sc->port[idx].link = up ? 1 : 0;
+	sc->port[idx].speed = up ? speed : 0;
+
 	if_link_state_change(sc->port[idx].ifp,
 	    up ? LINK_STATE_UP : LINK_STATE_DOWN);
 }
@@ -2234,6 +2328,7 @@ npugiu_detach(void)
 		if (sc->port[q].ifp == NULL)
 			continue;
 		ether_ifdetach(sc->port[q].ifp);
+		ifmedia_removeall(&sc->port[q].media);
 		if_free(sc->port[q].ifp);
 		sc->port[q].ifp = NULL;
 	}
