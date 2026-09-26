@@ -311,6 +311,100 @@ lines above show. Two hours went into chasing that indicator and concluding it m
 meant something, and the reason it was absent was that nothing in the driver was reporting
 carrier yet.
 
+#### A speed the stack can use, not just one it can print
+
+Knowing the speed and putting it in `SIOCGIFMEDIA` tells a human. It does not tell the kernel.
+
+`ether_ifattach` stamps `IF_Mbps(10)` on any Ethernet interface whose driver has not set its own
+figure - *"just a default"*, says the comment beside it in `if_ethersubr.c` - and nothing here ever
+had. So all fourteen front ports told the kernel they were 10 Mbit/s links.
+
+That is not cosmetic once the ports are bridged, because `if_bridge` costs its RSTP paths from
+`if_baudrate` using the formula in 802.1D-2004 section 17.14:
+
+| link | `if_baudrate` | RSTP path cost |
+|---|---|---|
+| what a 1G port should report | 1000000000 | 20000 |
+| what one of the 2.5G ports should report | 2500000000 | 8000 |
+| what every port actually reported | 10000000 | **2000000** |
+| unknown, or link down | 0 | 55 (`BSTP_DEFAULT_PATH_COST`) |
+
+A factor of a hundred, in the direction that makes the fastest link look worst. On this bridge it
+was visible immediately: the dark ports showed 55 and the live ones 2000000, which reads like the
+opposite of sense until you know that 55 is the default and 2000000 is a computed cost for
+10 Mbit/s. Put a 1G port and one of the two 2.5G ports in one bridge with a loop behind them and
+RSTP elects the wrong root port.
+
+The call itself is one line. It uses `ifmedia_baudrate()` so the figure and the media word cannot
+drift apart, and it runs **before** `if_link_state_change()`, because the recalculation happens
+from inside that call. `ifmedia_baudrate()` answers 0 for `IFM_AUTO`, which is what this driver
+reports when no speed is known, and 0 is the right answer: RSTP reads it as unknown and uses its
+own default, where 10 Mbit/s was a confident lie.
+
+And it changed nothing, which is the part worth writing down.
+
+#### The cost is latched, and UNKNOWN is what let a wrong one stand
+
+After the fix the ports still read 2000000. The driver was reporting `1000baseT` through the media
+layer at the same moment, so the speed was known and the call was running. Deleting a member and
+re-adding it by hand produced the right 20000 immediately - and that is the whole answer:
+
+**`if_bridge` computes a member's path cost once, in `bstp_create`, when the member is added.**
+OPNsense adds all eight of ours seconds after the driver loads, and the network agent does not
+publish its window for about fourteen. So the cost was latched from whatever the driver claimed
+during those first seconds, and nothing ever revisited it.
+
+`bstp_calc_path_cost` does arrange to try again - it sets `BSTP_PORT_PNDCOST`, which
+`bstp_ifupdstatus` acts on - but **only when it is asked about a link that is `LINK_STATE_DOWN`.**
+`LINK_STATE_UNKNOWN` is not down. It falls straight through to the baudrate, computes a cost, and
+sets no flag.
+
+This driver had been starting every port at `LINK_STATE_UNKNOWN` deliberately, and an earlier
+version of this file called that "the honest answer" for a carrier nobody had reported yet. It
+bought a number that was wrong by a factor of a hundred and shut the door on ever correcting it.
+`DOWN` is the better claim on both counts: it is the conservative one - we have no evidence of a
+link - and it is the one that leaves the door open. So attach now clears the 10 Mbit/s guess and
+says DOWN.
+
+That fixed the nine ports with nothing plugged in. They latch 55, the neutral default, where they
+used to latch 2000000.
+
+It did **not** fix the port with a cable in it, and the reason is worth the measurement it took.
+Sampling what the agent reports, once a second, from the moment the module loads:
+
+```
+t+9    10baseT/UTP        <- first carrier report, and the only moment RSTP will look
+t+10   10baseT/UTP
+t+11   10baseT/UTP
+t+12   none               <- the PHY renegotiates
+t+15   1000baseT          <- settled, and what it has been ever since
+```
+
+**The switch reports 10baseT for three seconds while autonegotiating a gigabit link.** RSTP spent
+its one recalculation on that reading: cost 2000000, `PNDCOST` cleared, never revisited. The
+carrier drop at t+12 does not help - `bstp_ifupdstatus` does not call `bstp_calc_path_cost` on the
+way down, so the flag is not re-armed.
+
+An earlier version of this section said the DOWN-at-attach change would correct the cost once
+carrier arrived. It does not, and the table it came with was wrong. What is actually true:
+
+| when the member is added | latched cost | later corrected? |
+|---|---|---|
+| UNKNOWN, baudrate 10 Mbit/s (before any of this) | 2000000 | no |
+| DOWN, baudrate 0, port dark (now) | 55 | only if carrier ever arrives |
+| DOWN, baudrate 0, then carrier at a transient 10 Mbit/s (now) | 2000000 | **no** |
+| member deleted and re-added by hand, once settled | **20000** | n/a |
+
+So the driver cannot make this number right. FreeBSD fixes a member's cost before the hardware is
+capable of knowing what it negotiated, and offers no way to ask for another look. The remaining
+levers are outside the driver: leave it, which costs nothing on a bridge with no redundant path
+and is the current state; or set it explicitly per member with `ifconfig bridge0 ifpathcost`, which
+is the only way to get 20000 and wants a hook that runs after the links settle.
+
+What the fix **does** buy is a correct `if_baudrate` - confirmed as `1000000000` on both live ports,
+read straight out of the kernel - which is what routing metrics and anything else asking about link
+speed will read.
+
 #### Promiscuous mode belongs to the switch
 
 Arming each port's "this is my address" entry is what an ordinary interface wants: the switch
@@ -333,6 +427,44 @@ after  promiscuous  20 of 20 arrived
 
 It is sent from the ioctl path with **no driver lock held**, because the agent's mailbox sleeps and
 this driver has already panicked once on sleeping under that mutex.
+
+#### Asking once is not enough
+
+The first version of that sent the request when `SIOCSIFFLAGS` arrived and took the answer as
+final. On the next reload the log said this, eight times:
+
+```
+nwa: Port1 would not open its catch-all (22)
+...
+nwa: mailbox ready after 10000 ms
+```
+
+`if_bridge` arms promiscuous mode on a member the instant it is added, and OPNsense adds its
+members seconds after the driver loads - which was **eight seconds before the agent's mailbox
+became usable**. Every request was refused with `EINVAL`, nothing retried, and the bridge forwarded
+broadcast and nothing else while all eight ports reported themselves healthy, at the right speed,
+with carrier. A fault that looks like working hardware is the worst shape one can take here, and
+it was introduced by the same change that made bridging possible.
+
+So the wanted state is no longer pushed and forgotten; it is **reconciled**. The agent's link poll
+already walks one port per tick, and it now also reads back what that port's `ifnet` is asking for
+and compares it with what the switch was last successfully told. They agree on almost every sweep,
+so the cost is a comparison; when they do not, one mailbox round trip fixes it and says so:
+
+```
+nwa: Port1 catch-all opened on retry
+```
+
+The record of what the switch was told lives in the agent's own per-port state, not in the datapath
+layer, because the agent is the only thing that can set it and the only thing that will notice a
+failure. The ioctl is a nudge that makes the common case immediate; its error is deliberately
+ignored. `p->promisc` starts at 0 rather than unknown, which is not laziness - it is what UMSD
+leaves TCAM entry 1 in after a reset, so a fresh sweep has nothing to reconcile unless something
+really is asking.
+
+This is the pattern the rest of the per-port state wants too. The address a port is told - the
+thing that makes unicast work at all - is sent once from the same bring-up path and is not
+reconciled, and it would fail the same way for the same reason.
 
 ## Why the module is not loaded automatically
 

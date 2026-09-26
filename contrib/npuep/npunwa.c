@@ -83,6 +83,12 @@ struct npunwa_port {
 	int		speed;		/* megabits, from the agent, 0 when dark */
 	int		media;		/* 3 fibre, 0 copper, -1 unknown */
 	int		up;		/* we commanded it up */
+	/*
+	 * What the switch was last SUCCESSFULLY told about this port's catch-all. Starts at 0
+	 * because that is the state UMSD leaves entry 1 in - written dead, matching nothing - so
+	 * the first sweep has nothing to reconcile unless something actually wants it open.
+	 */
+	int		promisc;
 };
 
 /* What one transaction found, handed back to whoever asked for it. */
@@ -469,6 +475,24 @@ npunwa_port_set_mac(struct npunwa_softc *sc, int n)
  * This sleeps - npunwa_command waits for the mailbox - so it is exported for npugiu to call from
  * its ioctl path with no lock held, never from the datapath.
  */
+static int
+npunwa_promisc_apply(struct npunwa_softc *sc, int idx, int on)
+{
+	int err;
+
+	mtx_assert(&sc->mtx, MA_OWNED);
+
+	on = on ? 1 : 0;
+	if (sc->port[idx].promisc == on)
+		return (0);
+
+	err = npunwa_command(sc, NWA_OP_SET, NWA_SUB_PROMISC,
+	    npuep_front_ports[idx].tag, (uint32_t)on, NULL, 0);
+	if (err == 0)
+		sc->port[idx].promisc = on;
+	return (err);
+}
+
 int
 npunwa_set_promisc(int idx, int on)
 {
@@ -479,15 +503,13 @@ npunwa_set_promisc(int idx, int on)
 		return (ENXIO);
 
 	mtx_lock(&sc->mtx);
-	err = npunwa_command(sc, NWA_OP_SET, NWA_SUB_PROMISC,
-	    npuep_front_ports[idx].tag, on ? 1 : 0, NULL, 0);
+	err = npunwa_promisc_apply(sc, idx, on);
 	mtx_unlock(&sc->mtx);
 
 	if (err != 0)
 		device_printf(sc->fac.dev,
-		    "nwa: %s would not %s its catch-all (%d) - a bridge on this port will "
-		    "forward broadcast only\n", npuep_front_ports[idx].label,
-		    on ? "open" : "close", err);
+		    "nwa: %s would not %s its catch-all (%d) - retrying from the link poll\n",
+		    npuep_front_ports[idx].label, on ? "open" : "close", err);
 	return (err);
 }
 
@@ -519,6 +541,7 @@ npunwa_bring_up(struct npunwa_softc *sc)
 		p->id = npuep_front_ports[n].tag;
 		p->link = -1;		/* unknown, so the first sweep always reports */
 		p->media = -1;
+		p->promisc = 0;		/* the switch's own state after a reset */
 
 		if (npunwa_port_set_state(sc, n, 1) != 0) {
 			device_printf(sc->fac.dev, "nwa: %s refused to come up\n",
@@ -604,6 +627,29 @@ npunwa_link_step(struct npunwa_softc *sc)
 				p->speed = 0;
 			npugiu_link_change(n, link, p->speed);
 		}
+	}
+
+	/*
+	 * Reconcile the catch-all, because asking once is not enough.
+	 *
+	 * if_bridge arms promiscuous mode on a member the moment it is added, and OPNsense adds
+	 * its members seconds after this driver loads - which on a measured boot was eight
+	 * seconds BEFORE the agent's mailbox became usable. All eight requests were refused with
+	 * EINVAL, nothing retried, and the bridge forwarded broadcast and nothing else while
+	 * every port looked healthy. That is the worst shape a fault can take here.
+	 *
+	 * So the wanted state is read back from the ifnet every sweep and compared with what the
+	 * switch was last successfully told. One port per tick, the same port the link work above
+	 * just handled, so this costs one extra mailbox round trip only when the two disagree.
+	 * It also covers any other reason a request might fail, not just the startup race.
+	 */
+	if (p->up) {
+		int want = npugiu_promisc_wanted(n);
+
+		if (want >= 0 && want != p->promisc &&
+		    npunwa_promisc_apply(sc, n, want) == 0)
+			device_printf(sc->fac.dev, "nwa: %s catch-all %s on retry\n",
+			    npuep_front_ports[n].label, want ? "opened" : "closed");
 	}
 
 	sc->sweep = (n + 1 >= NPUEP_NFRONT) ? 0 : n + 1;
