@@ -1,4 +1,7 @@
 #!/bin/sh
+#-
+# SPDX-License-Identifier: BSD-2-Clause
+#
 # Remove everything this repository installs.
 #
 # It does not put the coprocessor back into reset. Leaving a running NPU running is the less

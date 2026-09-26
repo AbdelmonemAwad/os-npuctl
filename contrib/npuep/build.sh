@@ -1,4 +1,7 @@
 #!/bin/sh
+#-
+# SPDX-License-Identifier: BSD-2-Clause
+#
 # Build the module on the appliance. Run from anywhere:  sh /root/npu/kmod/build.sh
 #
 # Separate from the Makefile so it can be invoked over ssh without three layers of quoting

@@ -1,4 +1,7 @@
 #!/bin/sh
+#-
+# SPDX-License-Identifier: BSD-2-Clause
+#
 # Run by pkg(8) as root after the files are in place.
 set -e
 

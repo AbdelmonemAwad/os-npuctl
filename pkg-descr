@@ -13,4 +13,4 @@ on hardware it recognises and does nothing at all on anything else.
 It also ships the kernel module that completes the handshake the coprocessor waits for, as
 source, to be built and loaded deliberately rather than automatically.
 
-WWW: https://github.com/AbdelmonemAwad/os-npuctl
+WWW: https://github.com/AbdelmonemAwad/os-xgs-npu

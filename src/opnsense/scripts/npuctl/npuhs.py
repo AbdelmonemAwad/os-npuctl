@@ -1,4 +1,7 @@
 #!/usr/local/bin/python3
+#-
+# SPDX-License-Identifier: BSD-2-Clause
+#
 """
 Read - and optionally complete - the Marvell NPU's host handshake, from FreeBSD userspace.
 
@@ -34,7 +37,7 @@ entirely - but the mechanism above is sufficient to explain it, and nothing here
 enough to rule it out.
 
 `up` therefore refuses to run without --yes-i-accept-the-risk. The right way to complete the
-handshake is os-npuctl's npuep.ko, which allocates the five MSI-X vectors FIRST and only then
+handshake is os-xgs-npu's npuep.ko, which allocates the five MSI-X vectors FIRST and only then
 sets the bits, in that order, for exactly this reason.
 """
 import mmap

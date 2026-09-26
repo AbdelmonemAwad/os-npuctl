@@ -1,4 +1,7 @@
 #!/bin/sh
+#-
+# SPDX-License-Identifier: BSD-2-Clause
+#
 # Check, on the appliance, that the whole chain still works.
 #
 # Run this after every OPNsense or FreeBSD update, and after anything that touches the boot path.
