@@ -21,11 +21,33 @@ install -d -m 0755 "${PREFIX}/opnsense/scripts/npuctl"
 install -m 0755 "${SRC}/src/opnsense/scripts/npuctl/mcp2210.py" "${PREFIX}/opnsense/scripts/npuctl/"
 install -m 0755 "${SRC}/src/opnsense/scripts/npuctl/npuhs.py" "${PREFIX}/opnsense/scripts/npuctl/"
 install -m 0755 "${SRC}/install/verify.sh" "${PREFIX}/opnsense/scripts/npuctl/verify.sh"
+install -m 0755 "${SRC}/src/opnsense/scripts/npuctl/bridge-pathcost.sh" \
+    "${PREFIX}/opnsense/scripts/npuctl/bridge-pathcost.sh"
 
 echo "== boot hook =="
 install -d -m 0755 "${PREFIX}/etc/rc.syshook.d/early"
 install -m 0755 "${SRC}/src/etc/rc.syshook.d/early/06-npuctl" "${PREFIX}/etc/rc.syshook.d/early/06-npuctl"
 install -m 0755 "${SRC}/src/etc/rc.syshook.d/early/07-npuep" "${PREFIX}/etc/rc.syshook.d/early/07-npuep"
+
+# devd fires this when a front port's link comes up, which is the only moment RSTP will accept a
+# path cost for it. See src/opnsense/scripts/npuctl/bridge-pathcost.sh for why that matters.
+#
+# A timer, not a link-up hook, and the reason is in bridge-pathcost.sh: devd executes only the
+# single highest-priority statement that matches an event, and OPNsense already claims
+# IFNET/LINK_UP at priority 101 to run its own linkup handling. Below that a rule never fires;
+# above it, ours would fire and silence OPNsense's. Neither is acceptable, so this runs on cron.
+#
+# /usr/local/etc/cron.d, not /etc/crontab - OPNsense regenerates the latter from its own
+# configuration and would drop the line.
+echo "== path cost timer =="
+install -d -m 0755 "${PREFIX}/etc/cron.d"
+install -m 0644 "${SRC}/src/etc/cron.d/npuctl" "${PREFIX}/etc/cron.d/npuctl"
+echo "   installed ${PREFIX}/etc/cron.d/npuctl (once a minute)"
+
+# And once now, so an install does not have to wait for the first tick.
+if [ -x "${PREFIX}/opnsense/scripts/npuctl/bridge-pathcost.sh" ]; then
+    "${PREFIX}/opnsense/scripts/npuctl/bridge-pathcost.sh" || true
+fi
 
 # And the module itself, if one has been built. It is not packaged - it is C against this kernel's
 # headers, so it is built on the appliance - but a built module that is never installed is a module
@@ -87,3 +109,8 @@ echo "     ${PREFIX}/etc/rc.syshook.d/early/06-npuctl"
 echo
 echo "   To see what the bridge reports, changing nothing:"
 echo "     python3 ${PREFIX}/opnsense/scripts/npuctl/mcp2210.py status"
+echo
+echo "   After reloading the module by hand, the front ports' ifnets are new, so a bridge over"
+echo "   them has to be rebuilt. The path costs follow within a minute on their own:"
+echo "     configctl interface bridge configure"
+echo "     ${PREFIX}/opnsense/scripts/npuctl/bridge-pathcost.sh   # or just wait"

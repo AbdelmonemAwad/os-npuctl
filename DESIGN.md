@@ -396,14 +396,61 @@ carrier arrived. It does not, and the table it came with was wrong. What is actu
 | member deleted and re-added by hand, once settled | **20000** | n/a |
 
 So the driver cannot make this number right. FreeBSD fixes a member's cost before the hardware is
-capable of knowing what it negotiated, and offers no way to ask for another look. The remaining
-levers are outside the driver: leave it, which costs nothing on a bridge with no redundant path
-and is the current state; or set it explicitly per member with `ifconfig bridge0 ifpathcost`, which
-is the only way to get 20000 and wants a hook that runs after the links settle.
+capable of knowing what it negotiated, and offers no way to ask for another look.
 
 What the fix **does** buy is a correct `if_baudrate` - confirmed as `1000000000` on both live ports,
-read straight out of the kernel - which is what routing metrics and anything else asking about link
-speed will read.
+read straight out of the kernel with `getifaddrs` - which is what routing metrics and anything else
+asking about link speed will read.
+
+#### Setting it from outside, once the link means something
+
+`ifconfig <bridge> ifpathcost <member> <cost>` is the one lever that works, so
+`src/opnsense/scripts/npuctl/bridge-pathcost.sh` pulls it. It computes the same 802.1D figure the
+kernel would have - `20000000 / megabits` - reads what is there, and writes only what differs.
+
+Three decisions in it are worth stating, because each is a thing deliberately not done:
+
+- **Dark ports are left alone.** Setting a cost sets `BSTP_PORT_ADMCOST`, which tells RSTP never to
+  compute one again, so pinning a guess for a port with no cable would outlast the guess. It keeps
+  the neutral 55 until a cable arrives.
+- **Only this driver's ports.** Every other NIC on this appliance reports its speed before OPNsense
+  gets round to bridging it, so the figure FreeBSD worked out is already right and meddling would
+  be worse.
+- **One `ifconfig -a` and one `awk` for the whole decision**, and no further process at all unless
+  something needs changing. That is what makes it cheap enough to run on a timer: 0.01 s measured.
+
+Measured: `npup1` went `2000000 -> 20000 (1000 Mb/s)`, its member flags gained `ADMCOST`, the seven
+dark ports stayed at 55, and a second run printed nothing and changed nothing.
+
+#### Why a timer and not a link-up hook
+
+The obvious trigger is `IFNET` / `LINK_UP` through devd, and it cannot be used. devd.conf(5) is
+explicit: *"If two statements match the same event, only the action of the statement with highest
+priority will be executed."* OPNsense already claims that event at priority **101**, to run
+`configctl interface linkup start`.
+
+So a rule below that never fires - which is exactly what a rule at 50 did here. It was installed,
+devd restarted, the module reloaded, and the cost stayed at 2000000 with nothing in the log. And a
+rule above 101 would fire and **silence OPNsense's own linkup handling** for these ports, which is
+not a trade worth making on a firewall to correct a number that only matters when a bridge has a
+redundant path.
+
+`/usr/local/etc/rc.linkup` has no extension point of its own, and no periodic syshook stage runs on
+this appliance. So it is cron, in `/usr/local/etc/cron.d/npuctl` - which this cron reads - rather
+than `/etc/crontab`, which OPNsense regenerates from its own configuration and would drop.
+
+Two things about devd cost a live service to learn, and are recorded in `install.sh` so they are not
+learned twice. **`service devd reload` does not exist** - `rc.d/devd` answers *unknown directive*.
+And **devd installs no `SIGHUP` handler**, so sending one applies the default action and kills it;
+doing that left this appliance with no devd at all, which means no DHCP renewal on a link event and
+none of OPNsense's own linkup handling. `service devd restart` is the only supported way.
+
+One more, smaller, and it is a correction to something written two paragraphs earlier in this same
+session. A first version of the script logged at `daemon.info` and appeared not to run at all. The
+conclusion drawn was that this box does not collect `daemon.*`; that was wrong. **The collector
+filters by severity, not by facility** - one message was sent at each of `info`, `notice` and `warn`
+and `/var/log` grepped for all three: `notice` and `warn` both arrived, `info` went nowhere. So the
+script logs at `daemon.notice`, which is also what `06-npuctl` and `07-npuep` already use.
 
 #### Promiscuous mode belongs to the switch
 
