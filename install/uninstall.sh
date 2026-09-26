@@ -31,7 +31,17 @@ rm -f "${PREFIX}/etc/rc.syshook.d/early/07-npuep"
 rm -f /boot/modules/npuep.ko
 rm -f "${PREFIX}/opnsense/scripts/npuctl/mcp2210.py"
 rm -f "${PREFIX}/opnsense/scripts/npuctl/npuhs.py"
+rm -f "${PREFIX}/opnsense/scripts/npuctl/bridge-pathcost.sh"
+rm -f "${PREFIX}/opnsense/scripts/npuctl/verify.sh"
 rmdir "${PREFIX}/opnsense/scripts/npuctl" 2>/dev/null || true
+
+# The devd rule goes, and devd is told, because a rule whose script has just been deleted would
+# otherwise log a failure on every link event until the next reboot.
+rm -f "${PREFIX}/etc/cron.d/npuctl"
+
+# Any path cost this set is LEFT ALONE. It is per-member state inside a bridge somebody else
+# configured, it is the right number for the link that is running, and clearing it would need a
+# guess about what to put back.
 
 # hidraw_load is left in loader.conf.local on purpose: it is harmless, it may have been there
 # before this plugin, and removing a line somebody else added is worse than leaving one behind.

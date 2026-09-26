@@ -1,0 +1,18 @@
+#
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Keep the RSTP path cost of each bridged front port matched to the speed it is running at.
+#
+# See src/opnsense/scripts/npuctl/bridge-pathcost.sh for why this is needed and why it is a timer
+# rather than a link-up hook. The short version: if_bridge fixes a member's cost before these ports
+# can know what they negotiated and never asks again, and devd runs only the single
+# highest-priority statement for an event - which OPNsense already claims for IFNET/LINK_UP.
+#
+# Installed into /usr/local/etc/cron.d, which this cron reads, rather than into /etc/crontab, which
+# OPNsense regenerates from its own configuration.
+#
+# Once a minute, and the script is built for it: one ifconfig -a, one awk, and no further process
+# at all unless something actually needs changing - which on a settled machine is never.
+#
+#minute	hour	mday	month	wday	who	command
+*/1	*	*	*	*	root	/usr/local/opnsense/scripts/npuctl/bridge-pathcost.sh
