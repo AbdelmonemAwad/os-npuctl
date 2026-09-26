@@ -203,6 +203,58 @@ interfaces whose link state, speed and MTU can be read and set** need Sophos's N
 set, which rides the AGNIC custom channel and is not published - it has to be recovered from
 `mv_nwa_host` the way the MCP2210 command map was recovered from `xgs-usb-spi-flash`.
 
+#### Proving the tag table, one port at a time
+
+An ARP exchange with a device on the far end proves one path. It proves nothing about the other
+eleven, and it proves nothing either way when the far end declines to answer - which cost half an
+hour here, pinging a gateway that had been unplugged from that wire hours earlier.
+
+`tcpdump` on the sending interface does not help. That is a BPF tap taken before the frame is
+handed to the coprocessor, so it says the driver transmitted. It cannot say anything came out of
+the connector.
+
+`contrib/npuep/portmap.sh` settles it without a far end at all: transmit out of every port in
+turn, with a loopback cable between pairs, and record which port hears it. Twelve of the fourteen,
+in one sweep:
+
+```
+  npup3 ↔ npup4     0x8300 ↔ 0x8400   switch
+  npup5 ↔ npup6     0x8500 ↔ 0x8600   switch
+  npup7 ↔ npup8     0x8700 ↔ 0x8800   switch
+  npup9 ↔ npup10    0x0001 ↔ 0x0003   SoC
+  npup11 ↔ npup12   0x0004 ↔ 0x0002   SoC
+```
+
+with `npup1 ↔ npup2` measured separately first. Three results come out of it.
+
+**Egress reaches the connector.** Nothing before this had shown that; it was inferred from the
+frame format and from one ARP exchange.
+
+**The SoC tag order is right.** Those four are tagged `0x0001, 0x0003, 0x0004, 0x0002` in
+connector order rather than sequentially, and that ordering was read out of a disassembly, never
+documented. If `0x0002` and `0x0003` were the wrong way round, a frame leaving `npup10` would have
+come out at the connector next to `npup11` and been heard there. It was heard on `npup9`.
+
+**The internal switch does not forward between front ports.** The sending port's own counter never
+moved, in any of the twelve. So every frame crossing between two front ports goes up to the host
+and back down, and `pf` sees all of it. Had the switch forwarded on its own, rules would be
+bypassed by traffic the firewall never saw - which is the kind of thing that is discovered after
+it matters rather than before.
+
+`PortF1` and `PortF2` are the SFP cages and remain **untested**: a copper patch lead cannot loop a
+fibre cage, and no module was to hand.
+
+#### Link state is only reported for the SoC ports
+
+The network agent reports carrier for the four SoC ports and has never once reported it for any of
+the ten switch ports - not while a switch port was demonstrably linked and passing frames, and not
+when a cable was plugged into one. `nwa: 14 of 14 ports up` at attach shows the agent is
+addressing all fourteen for the bring-up command, so this is specific to link state.
+
+The consequence is not cosmetic: `ifconfig` shows no `status:` line for the ten switch ports, so
+OPNsense cannot see a cable being plugged into one, and neither can a human reading the output.
+Open.
+
 ## Why the module is not loaded automatically
 
 It is installed but never loaded by the plugin, and that is deliberate on three counts.
@@ -255,10 +307,44 @@ an unrelated subsystem, some minutes later, with no device errors logged in betw
 that prevents it had been written, carefully, and left reachable only from a path that a reboot
 never takes.
 
-The quiescing half of detach is now a function of its own - withdraw the facilities newest first,
-stop the heartbeat, clear `HOST_INIT` and `HOST_ALIVE`, disable bus mastering - and `device_detach`
-and `device_shutdown` both call it. Detach goes on to hand the resources back. Shutdown does not,
-because the machine is about to stop caring about them.
+### And the obvious fix hung the machine
+
+The first attempt made the quiescing half of detach a function of its own and had both
+`device_detach` and `device_shutdown` call it: withdraw the facilities newest first, drain the
+heartbeat, clear `HOST_INIT` and `HOST_ALIVE`, disable bus mastering. It reads correctly. The first
+reboot after it went in never came back.
+
+```
+06:16:43  reboot: rebooted by root
+06:16:43  syslog-ng: syslog-ng shutting down
+          ... thirty minutes of nothing ...
+06:47:00  kernel: ---<<BOOT>>---        <- and kern.boottime is the power cycle
+```
+
+No `---<<BOOT>>---` in between, and the boot time afterwards is when the power was pulled. The
+machine entered shutdown and never reached the reset.
+
+**Every one of those withdrawals waits.** They wait for a coprocessor to acknowledge, and they
+drain taskqueue threads. That is correct in `kldunload`, where the system is running underneath
+them. Device shutdown methods run late in `kern_reboot`, after the filesystems have been flushed,
+and waiting on anything there is a request to be hung.
+
+So `device_shutdown` now does only what actually stops the endpoint writing into host memory, and
+only in register writes that return:
+
+- clear `HOST_INIT` and `HOST_ALIVE`, so the far side is told;
+- clear the **bus master** bit, so it is stopped whether or not it was listening. Every DMA write
+  and every MSI-X message is a memory write from the endpoint, so this covers the interrupts too -
+  and it is enforced by the root complex rather than by the coprocessor's cooperation, which is why
+  it is the one step that matters.
+
+`callout_stop` rather than `callout_drain`, because stop does not wait for a callout already
+running and the heartbeat's whole job is one register write that is harmless at that point. The
+facility teardown stays in `device_detach`, where there is a system to wait on.
+
+The general lesson is not about this driver. A teardown written for module unload is not a shutdown
+handler, however similar the two look, and the difference does not show up in review - it shows up
+as a machine that goes quiet and never comes back.
 
 ## Which kernel sources the module is built against
 

@@ -40,7 +40,7 @@ jobs:
         run: |
           set -eu
 
-          tested=$(python3 -c "import json;print(json.load(open('compat.json'))['opnsense'])")
+          tested=$(python3 -c "import json;d=json.load(open('compat.json'));print(d.get('upstream_release') or d['opnsense'])")
           echo "tested against: ${tested}"
 
           # The release list rather than "latest": OPNsense tags business editions and release
@@ -54,9 +54,18 @@ jobs:
           fi
           echo "upstream latest: ${latest}"
 
-          # Compare on the major.minor only. Point releases do not move FreeBSD and are not what
-          # this is guarding against; a new minor is.
-          norm() { echo "$1" | sed -E 's/^v//; s/^([0-9]+\.[0-9]+).*/\1/'; }
+          # Compare the WHOLE version, not just the major.minor.
+          #
+          # This used to normalise both sides to major.minor, on the reasoning - written right
+          # here - that "point releases do not move FreeBSD and are not what this is guarding
+          # against". That was measured false on the appliance. 26.7 -> 26.7.4 ships a 32.9MB
+          # kernel set and a 97.9MB base set, so it replaces /boot/kernel, which is precisely the
+          # event that invalidates the module - and it does so while leaving the two labels a
+          # human would check, "OPNsense 26.7" and "FreeBSD 15.1-RELEASE-p1", completely unmoved.
+          #
+          # A point release is therefore the COMMON case of what this file exists to catch, and
+          # the old comparison was blind to exactly that case.
+          norm() { echo "$1" | sed -E 's/^v//'; }
           if [ "$(norm "${latest}")" = "$(norm "${tested}")" ]; then
             echo "still ${tested} - nothing to do"
             echo "moved=no" >> "$GITHUB_OUTPUT"
@@ -84,29 +93,36 @@ jobs:
           fi
 
           gh issue create --title "${title}" --label upstream --body "$(cat <<EOF
-Upstream moved to **${LATEST}**. \`compat.json\` records **${TESTED}**.
+          Upstream moved to **${LATEST}**. \`compat.json\` records **${TESTED}**.
 
-This is not a failure - it is the point at which the kernel module stops being known to work.
+          This is not a failure - it is the point at which the kernel module stops being known to work.
 
-**What actually breaks.** \`contrib/npuep\` is C against one kernel's headers. If this release
-carries a different FreeBSD, the installed \`/boot/modules/npuep.ko\` will not load. The boot hook
-\`07-npuep\` then exits 0 by design, because a firewall that boots late is better than one that
-does not boot - so the appliance comes up with **no front ports and no error that points here**.
+          **What actually breaks.** \`contrib/npuep\` is C against one kernel's headers, and an OPNsense
+          release ships a kernel set even when it is only a point release - so do not check the version
+          labels, because they do not move. Compare \`sysctl -n kern.version\` against \`kern_version\`
+          in \`compat.json\`.
 
-**Before updating the appliance**
+          Note also that the module will very likely **load anyway**. Its kernel dependency is a range
+          running to the end of the branch, so a mismatch inside 15.x is not refused and nothing is
+          printed; \`install/verify.sh\` compares the build stamp instead. Where it genuinely does not
+          load, the boot hook
+          \`07-npuep\` then exits 0 by design, because a firewall that boots late is better than one that
+          does not boot - so the appliance comes up with **no front ports and no error that points here**.
 
-1. Note the FreeBSD version the new release carries.
-2. Keep console access. If the front ports are the appliance's only path in, an update that
-   breaks the module locks you out of everything but the serial console.
+          **Before updating the appliance**
 
-**After updating**
+          1. Note the FreeBSD version the new release carries.
+          2. Keep console access. If the front ports are the appliance's only path in, an update that
+             breaks the module locks you out of everything but the serial console.
 
-1. \`sh contrib/npuep/build.sh\` on the appliance, then reinstall: \`./install/install.sh\`.
-2. **Restart the coprocessor.** The datapath attaches once per coprocessor boot, so a rebuilt
-   module is not enough on its own. \`sh contrib/npuep/reload.sh\` pulses its reset line, waits
-   for its facility table and reloads - verified to bring all fourteen ports back without
-   touching the power. A cold power cycle also works if that does not.
-3. \`sh install/verify.sh\` and read every line.
-4. Only when that passes, update \`compat.json\` and close this issue.
-EOF
-)"
+          **After updating**
+
+          1. \`sh contrib/npuep/build.sh\` on the appliance, then reinstall: \`./install/install.sh\`.
+          2. **Restart the coprocessor.** The datapath attaches once per coprocessor boot, so a rebuilt
+             module is not enough on its own. \`sh contrib/npuep/reload.sh\` pulses its reset line, waits
+             for its facility table and reloads - verified to bring all fourteen ports back without
+             touching the power. A cold power cycle also works if that does not.
+          3. \`sh install/verify.sh\` and read every line.
+          4. Only when that passes, update \`compat.json\` and close this issue.
+          EOF
+          )"

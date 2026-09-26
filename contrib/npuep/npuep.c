@@ -65,10 +65,6 @@
 static int	npuep_detach(device_t);
 static int	npuep_shutdown(device_t);
 
-/* Declared here so the prototype below does not invent a struct of its own. */
-struct npuep_softc;
-static void	npuep_quiesce(struct npuep_softc *);
-
 /* barmap.h */
 #define	NPU_BARMAP_COOKIE	0xD0FAC10DU
 #define	NPU_BARMAP_VERSION	5U
@@ -172,7 +168,6 @@ struct npuep_softc {
 	int			 busmaster;	/* we turned it on, we turn it off */
 	int			 handshaken;	/* HOST_INIT was set by us */
 	int			 lost;		/* endpoint stopped decoding */
-	int			 quiesced;	/* the far side has been told to stop */
 	struct npuep_dbell	 dbell[NPUEP_TOTAL_DBELLS];
 
 	struct callout		 heartbeat;
@@ -1188,7 +1183,46 @@ npuep_detach(device_t dev)
 	struct npuep_softc *sc = device_get_softc(dev);
 	int i;
 
-	npuep_quiesce(sc);
+	/* Withdraw from the far side before anything underneath it is torn down, newest first. */
+	npurpc_detach();
+	npunwa_detach();
+	npugiu_detach();
+	npumgmt_detach();
+
+	if (mtx_initialized(&sc->mtx)) {
+		NPUEP_LOCK(sc);
+		sc->running = 0;
+		NPUEP_UNLOCK(sc);
+		callout_drain(&sc->heartbeat);
+	}
+
+	/*
+	 * Withdraw before tearing anything down, and in this order.
+	 *
+	 * Clearing HOST_INIT and HOST_ALIVE is the only way to tell the far side we are leaving.
+	 * It matters because the NPU raises a doorbell by writing the MSI message itself - so once
+	 * the vectors are freed and the table is reused, its writes land on whatever took their
+	 * place. Stopping the heartbeat alone is not enough: that takes a scan or more for the
+	 * target to notice, and the race is exactly the window in which this module is being
+	 * unloaded.
+	 *
+	 * This is still not airtight. There is no acknowledgement to wait for, and a reset pulse
+	 * before unloading is the only way to be certain the NPU has stopped.
+	 *
+	 * Everything above this point WAITS - on the coprocessor, and on taskqueue threads. That is
+	 * fine here and it is why npuep_shutdown does none of it: see the comment on that function.
+	 */
+	if (sc->handshaken && sc->bar2 != NULL && !sc->lost) {
+		uint32_t hs = bar2_read(sc, sc->ctrl + 4);
+
+		if (hs != 0xFFFFFFFFU) {
+			bar2_write(sc, sc->ctrl + 4,
+			    hs & ~(CTRL_FCLT_HOST_INIT | CTRL_FCLT_HOST_ALIVE));
+			device_printf(dev, "withdrew HOST_INIT and HOST_ALIVE "
+			    "(handshake now 0x%08x)\n", bar2_read(sc, sc->ctrl + 4));
+		}
+		sc->handshaken = 0;
+	}
 
 	for (i = 0; i < NPUEP_TOTAL_DBELLS; i++) {
 		struct npuep_dbell *db = &sc->dbell[i];
@@ -1214,6 +1248,12 @@ npuep_detach(device_t dev)
 		bus_release_resource(dev, SYS_RES_MEMORY, sc->bar0_rid,
 		    sc->bar0);
 
+	/* Last, and never skipped: no driver means no bus mastering. */
+	if (sc->busmaster) {
+		pci_disable_busmaster(dev);
+		sc->busmaster = 0;
+	}
+
 	if (mtx_initialized(&sc->mtx))
 		mtx_destroy(&sc->mtx);
 
@@ -1221,86 +1261,69 @@ npuep_detach(device_t dev)
 }
 
 /*
- * Make the coprocessor stop writing into this host's memory, and do nothing else.
- *
- * Shared by detach and shutdown, because the hazard is the same one and only the aftermath
- * differs: detach goes on to hand the resources back, shutdown leaves them exactly where they are
- * because the machine is about to stop caring. Idempotent, because both can run.
- */
-static void
-npuep_quiesce(struct npuep_softc *sc)
-{
-	device_t dev = sc->dev;
-
-	if (sc->quiesced)
-		return;
-	sc->quiesced = 1;
-
-	/* Withdraw from the far side before anything underneath it is torn down, newest first. */
-	npurpc_detach();
-	npunwa_detach();
-	npugiu_detach();
-	npumgmt_detach();
-
-	if (mtx_initialized(&sc->mtx)) {
-		NPUEP_LOCK(sc);
-		sc->running = 0;
-		NPUEP_UNLOCK(sc);
-		callout_drain(&sc->heartbeat);
-	}
-
-	/*
-	 * Withdraw before tearing anything down, and in this order.
-	 *
-	 * Clearing HOST_INIT and HOST_ALIVE is the only way to tell the far side we are
-	 * leaving. It matters because the NPU raises a doorbell by writing the MSI message
-	 * itself - so once the vectors are freed and the table is reused, its writes land on
-	 * whatever took their place. Stopping the heartbeat alone is not enough: that takes a
-	 * scan or more for the target to notice, and the race is exactly the window in which
-	 * this module is being unloaded.
-	 *
-	 * This is still not airtight. There is no acknowledgement to wait for, and a reset
-	 * pulse before unloading is the only way to be certain the NPU has stopped.
-	 */
-	if (sc->handshaken && sc->bar2 != NULL && !sc->lost) {
-		uint32_t hs = bar2_read(sc, sc->ctrl + 4);
-
-		if (hs != 0xFFFFFFFFU) {
-			bar2_write(sc, sc->ctrl + 4,
-			    hs & ~(CTRL_FCLT_HOST_INIT | CTRL_FCLT_HOST_ALIVE));
-			device_printf(dev, "withdrew HOST_INIT and HOST_ALIVE "
-			    "(handshake now 0x%08x)\n", bar2_read(sc, sc->ctrl + 4));
-		}
-		sc->handshaken = 0;
-	}
-
-	/* Last, and never skipped: no driver means no bus mastering. */
-	if (sc->busmaster) {
-		pci_disable_busmaster(dev);
-		sc->busmaster = 0;
-	}
-}
-
-/*
  * The machine is going down, and FreeBSD will not call detach on the way.
  *
- * Without this method a reboot leaves the endpoint bus-mastering with its MSI-X vectors armed and
+ * Without this method a reboot leaves the endpoint bus mastering, with its MSI-X vectors armed and
  * the ring addresses this kernel published still live, so it goes on writing received frames and
- * doorbell messages into physical memory that the next kernel is about to hand to something else.
+ * doorbell messages into physical memory the next kernel is about to hand to something else.
  * docs/porting-notes.md records what that looks like from the other end: a fault in an unrelated
- * subsystem, some minutes later, with no device errors logged in between - which is as hard a bug
- * to find as this project has produced.
+ * subsystem, some minutes later, with no device errors logged in between.
  *
  * It is not a hypothetical on this appliance. OPNsense's own early syshook 05-upgrade reboots the
  * machine from inside the boot sequence whenever it finds a pending firmware set, with no warning
- * and no opportunity to unload anything. The hooks are numbered to run after it; this is the half
- * of that fix which does not depend on the numbering being right.
+ * and no opportunity to unload anything.
+ *
+ * NOTHING HERE MAY BLOCK, and that cost a power cycle to learn. The first version of this method
+ * simply called the same teardown as detach - four facility withdrawals and a callout_drain - and
+ * the machine stopped dead. The log reads `reboot: rebooted by root`, then syslog-ng shutting
+ * down, then nothing whatsoever for thirty minutes until the power was pulled: no ---<<BOOT>>---,
+ * and kern.boottime afterwards is the power cycle rather than a reboot. It never reached the reset.
+ *
+ * Those withdrawals wait, on a coprocessor to acknowledge and on taskqueue threads to drain. That
+ * is correct in kldunload, where the system is running underneath them. Device shutdown methods
+ * run late in kern_reboot, after the filesystems are flushed, and waiting on anything there is a
+ * request to be hung.
+ *
+ * So this does only what actually stops the endpoint writing into host memory, in register writes
+ * that return:
+ *
+ *   - clear HOST_INIT and HOST_ALIVE, so the far side is told;
+ *   - clear the bus master bit, so it is stopped whether or not it was listening. Every DMA write
+ *     and every MSI-X message is a memory write from the endpoint, so this covers the interrupts
+ *     too - and it is enforced by the root complex rather than by the coprocessor's cooperation,
+ *     which is the whole reason it is the one step that matters.
+ *
+ * callout_stop rather than callout_drain: stop does not wait for a callout already running, and
+ * the heartbeat's entire job is one register write that is harmless at this point.
  */
 static int
 npuep_shutdown(device_t dev)
 {
+	struct npuep_softc *sc = device_get_softc(dev);
 
-	npuep_quiesce(device_get_softc(dev));
+	if (mtx_initialized(&sc->mtx)) {
+		NPUEP_LOCK(sc);
+		sc->running = 0;
+		callout_stop(&sc->heartbeat);
+		NPUEP_UNLOCK(sc);
+	}
+
+	if (sc->handshaken && sc->bar2 != NULL && !sc->lost) {
+		uint32_t hs = bar2_read(sc, sc->ctrl + 4);
+
+		if (hs != 0xFFFFFFFFU)
+			bar2_write(sc, sc->ctrl + 4,
+			    hs & ~(CTRL_FCLT_HOST_INIT | CTRL_FCLT_HOST_ALIVE));
+		sc->handshaken = 0;
+	}
+
+	if (sc->busmaster) {
+		pci_disable_busmaster(dev);
+		sc->busmaster = 0;
+	}
+
+	/* On a serial console this is the line that says the method ran and returned. */
+	device_printf(dev, "shutdown: bus mastering disabled\n");
 	return (0);
 }
 
