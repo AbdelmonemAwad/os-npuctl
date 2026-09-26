@@ -63,6 +63,11 @@
 #include "npuep.h"
 
 static int	npuep_detach(device_t);
+static int	npuep_shutdown(device_t);
+
+/* Declared here so the prototype below does not invent a struct of its own. */
+struct npuep_softc;
+static void	npuep_quiesce(struct npuep_softc *);
 
 /* barmap.h */
 #define	NPU_BARMAP_COOKIE	0xD0FAC10DU
@@ -167,6 +172,7 @@ struct npuep_softc {
 	int			 busmaster;	/* we turned it on, we turn it off */
 	int			 handshaken;	/* HOST_INIT was set by us */
 	int			 lost;		/* endpoint stopped decoding */
+	int			 quiesced;	/* the far side has been told to stop */
 	struct npuep_dbell	 dbell[NPUEP_TOTAL_DBELLS];
 
 	struct callout		 heartbeat;
@@ -449,7 +455,7 @@ npuep_barmap_complete(struct npuep_softc *sc)
  * second later, and a second is nowhere near long enough for the far side's Linux to come
  * back up.
  *
- * It looks like it works at boot only by accident: `01-npuctl` pulses reset there too, but
+ * It looks like it works at boot only by accident: `06-npuctl` pulses reset there too, but
  * a minute of other boot work happens before this module is loaded, and by then the table
  * is finished. Measured on this board: complete at 60 seconds after the pulse, so the wait
  * below is twice that and still the difference between fourteen front ports and none.
@@ -1182,6 +1188,54 @@ npuep_detach(device_t dev)
 	struct npuep_softc *sc = device_get_softc(dev);
 	int i;
 
+	npuep_quiesce(sc);
+
+	for (i = 0; i < NPUEP_TOTAL_DBELLS; i++) {
+		struct npuep_dbell *db = &sc->dbell[i];
+
+		if (db->cookie != NULL)
+			bus_teardown_intr(dev, db->irq, db->cookie);
+		if (db->irq != NULL)
+			bus_release_resource(dev, SYS_RES_IRQ, db->rid,
+			    db->irq);
+		db->cookie = NULL;
+		db->irq = NULL;
+	}
+	if (sc->nvec > 0)
+		pci_release_msi(dev);
+
+	if (sc->bar4 != NULL)
+		bus_release_resource(dev, SYS_RES_MEMORY, sc->bar4_rid,
+		    sc->bar4);
+	if (sc->bar2 != NULL)
+		bus_release_resource(dev, SYS_RES_MEMORY, sc->bar2_rid,
+		    sc->bar2);
+	if (sc->bar0 != NULL)
+		bus_release_resource(dev, SYS_RES_MEMORY, sc->bar0_rid,
+		    sc->bar0);
+
+	if (mtx_initialized(&sc->mtx))
+		mtx_destroy(&sc->mtx);
+
+	return (0);
+}
+
+/*
+ * Make the coprocessor stop writing into this host's memory, and do nothing else.
+ *
+ * Shared by detach and shutdown, because the hazard is the same one and only the aftermath
+ * differs: detach goes on to hand the resources back, shutdown leaves them exactly where they are
+ * because the machine is about to stop caring. Idempotent, because both can run.
+ */
+static void
+npuep_quiesce(struct npuep_softc *sc)
+{
+	device_t dev = sc->dev;
+
+	if (sc->quiesced)
+		return;
+	sc->quiesced = 1;
+
 	/* Withdraw from the far side before anything underneath it is torn down, newest first. */
 	npurpc_detach();
 	npunwa_detach();
@@ -1220,39 +1274,33 @@ npuep_detach(device_t dev)
 		sc->handshaken = 0;
 	}
 
-	for (i = 0; i < NPUEP_TOTAL_DBELLS; i++) {
-		struct npuep_dbell *db = &sc->dbell[i];
-
-		if (db->cookie != NULL)
-			bus_teardown_intr(dev, db->irq, db->cookie);
-		if (db->irq != NULL)
-			bus_release_resource(dev, SYS_RES_IRQ, db->rid,
-			    db->irq);
-		db->cookie = NULL;
-		db->irq = NULL;
-	}
-	if (sc->nvec > 0)
-		pci_release_msi(dev);
-
-	if (sc->bar4 != NULL)
-		bus_release_resource(dev, SYS_RES_MEMORY, sc->bar4_rid,
-		    sc->bar4);
-	if (sc->bar2 != NULL)
-		bus_release_resource(dev, SYS_RES_MEMORY, sc->bar2_rid,
-		    sc->bar2);
-	if (sc->bar0 != NULL)
-		bus_release_resource(dev, SYS_RES_MEMORY, sc->bar0_rid,
-		    sc->bar0);
-
 	/* Last, and never skipped: no driver means no bus mastering. */
 	if (sc->busmaster) {
 		pci_disable_busmaster(dev);
 		sc->busmaster = 0;
 	}
+}
 
-	if (mtx_initialized(&sc->mtx))
-		mtx_destroy(&sc->mtx);
+/*
+ * The machine is going down, and FreeBSD will not call detach on the way.
+ *
+ * Without this method a reboot leaves the endpoint bus-mastering with its MSI-X vectors armed and
+ * the ring addresses this kernel published still live, so it goes on writing received frames and
+ * doorbell messages into physical memory that the next kernel is about to hand to something else.
+ * docs/porting-notes.md records what that looks like from the other end: a fault in an unrelated
+ * subsystem, some minutes later, with no device errors logged in between - which is as hard a bug
+ * to find as this project has produced.
+ *
+ * It is not a hypothetical on this appliance. OPNsense's own early syshook 05-upgrade reboots the
+ * machine from inside the boot sequence whenever it finds a pending firmware set, with no warning
+ * and no opportunity to unload anything. The hooks are numbered to run after it; this is the half
+ * of that fix which does not depend on the numbering being right.
+ */
+static int
+npuep_shutdown(device_t dev)
+{
 
+	npuep_quiesce(device_get_softc(dev));
 	return (0);
 }
 
@@ -1260,6 +1308,7 @@ static device_method_t npuep_methods[] = {
 	DEVMETHOD(device_probe,		npuep_probe),
 	DEVMETHOD(device_attach,	npuep_attach),
 	DEVMETHOD(device_detach,	npuep_detach),
+	DEVMETHOD(device_shutdown,	npuep_shutdown),
 	DEVMETHOD_END
 };
 

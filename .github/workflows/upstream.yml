@@ -90,7 +90,7 @@ This is not a failure - it is the point at which the kernel module stops being k
 
 **What actually breaks.** \`contrib/npuep\` is C against one kernel's headers. If this release
 carries a different FreeBSD, the installed \`/boot/modules/npuep.ko\` will not load. The boot hook
-\`02-npuep\` then exits 0 by design, because a firewall that boots late is better than one that
+\`07-npuep\` then exits 0 by design, because a firewall that boots late is better than one that
 does not boot - so the appliance comes up with **no front ports and no error that points here**.
 
 **Before updating the appliance**

@@ -21,16 +21,20 @@ install -m 0755 "${SRC}/install/verify.sh" "${PREFIX}/opnsense/scripts/npuctl/ve
 
 echo "== boot hook =="
 install -d -m 0755 "${PREFIX}/etc/rc.syshook.d/early"
-install -m 0755 "${SRC}/src/etc/rc.syshook.d/early/01-npuctl" "${PREFIX}/etc/rc.syshook.d/early/01-npuctl"
-install -m 0755 "${SRC}/src/etc/rc.syshook.d/early/02-npuep" "${PREFIX}/etc/rc.syshook.d/early/02-npuep"
+install -m 0755 "${SRC}/src/etc/rc.syshook.d/early/06-npuctl" "${PREFIX}/etc/rc.syshook.d/early/06-npuctl"
+install -m 0755 "${SRC}/src/etc/rc.syshook.d/early/07-npuep" "${PREFIX}/etc/rc.syshook.d/early/07-npuep"
 
 # And the module itself, if one has been built. It is not packaged - it is C against this kernel's
 # headers, so it is built on the appliance - but a built module that is never installed is a module
 # somebody has to remember to load by hand, and forgetting is what makes a firewall come up without
-# its ports. /boot/modules is where 02-npuep looks.
+# its ports. /boot/modules is where 07-npuep looks.
 echo "== kernel module =="
+# The appliance's own build directory comes FIRST, and the order is deliberate. A .ko is only
+# valid for the kernel it was compiled against, /root/npu/kmod is where it is compiled on the
+# machine it will run on, and a checkout can carry a stale one from anywhere. Searching the
+# checkout first meant a left-over file won silently and the next boot loaded the wrong build.
 KO=""
-for c in "${SRC}/contrib/npuep/npuep.ko" /root/npu/kmod/npuep.ko; do
+for c in /root/npu/kmod/npuep.ko "${SRC}/contrib/npuep/npuep.ko"; do
     if [ -f "${c}" ]; then
         KO="${c}"
         break
@@ -40,6 +44,19 @@ if [ -n "${KO}" ]; then
     install -d -m 0755 /boot/modules
     install -m 0555 "${KO}" /boot/modules/npuep.ko
     echo "   installed ${KO} as /boot/modules/npuep.ko"
+    # Carry the build's kernel stamp with it, and say so now rather than at the next boot.
+    if [ -f "${KO}.kernel" ]; then
+        install -m 0444 "${KO}.kernel" /boot/modules/npuep.ko.kernel
+        if [ "$(cat "${KO}.kernel")" != "$(uname -v)" ]; then
+            echo "   WARNING: built against a different kernel than the one running."
+            echo "            built  : $(cat "${KO}.kernel")"
+            echo "            running: $(uname -v)"
+            echo "            Rebuild before rebooting: sh contrib/npuep/build.sh"
+        fi
+    else
+        rm -f /boot/modules/npuep.ko.kernel
+        echo "   no kernel stamp beside it - verify.sh cannot tell whether it matches"
+    fi
 else
     echo "   none built yet - see contrib/npuep/build.sh; the boot hook will skip until there is one"
 fi
@@ -63,7 +80,7 @@ echo "   Both hooks run at the next boot: 01 releases the NPU from reset, 02 loa
 echo "   and waits for the front ports so that OPNsense's interface configuration can see them."
 echo
 echo "   To release the NPU now, without rebooting:"
-echo "     ${PREFIX}/etc/rc.syshook.d/early/01-npuctl"
+echo "     ${PREFIX}/etc/rc.syshook.d/early/06-npuctl"
 echo
 echo "   To see what the bridge reports, changing nothing:"
 echo "     python3 ${PREFIX}/opnsense/scripts/npuctl/mcp2210.py status"

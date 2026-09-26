@@ -1,8 +1,9 @@
 #!/bin/sh
 # Load the NPU endpoint driver, and wait for its interfaces before OPNsense configures them.
 #
-# Numbered 02 so it runs after 01-npuctl, and the order is not a preference: 01 is what pulses the
+# Numbered 07 so it runs after 06-npuctl, and the order is not a preference: 06 is what pulses the
 # coprocessor out of reset, and until that has happened there is no live device here to attach to.
+# Both are numbered above OPNsense's own 05-upgrade, for a reason 06-npuctl sets out at length.
 # The same fact rules out loader.conf, along with a second one - the BAR restore this hardware
 # needs only happens on the kldload path. See docs/porting-notes.md.
 #
@@ -19,10 +20,13 @@
 # its ports, and a firewall that does not boot at all is worse than both. Every failure here logs
 # and exits 0: no module, unfamiliar hardware, a coprocessor that never answers.
 #
-# One caveat that is a property of the hardware and not of this script: the datapath attaches once
-# per COPROCESSOR boot. After a warm reboot of the host the coprocessor is still running from
-# before and will not answer a second bring-up, so the interfaces will not appear and the driver
-# says so in its own messages. A cold power cycle is what restores it.
+# One property of the hardware rather than of this script: the datapath attaches once per
+# COPROCESSOR boot, so a host reboot on its own is not enough - the coprocessor is still running
+# from before and will not answer a second bring-up. What restores it is the reset pulse 06-npuctl
+# issues on every boot, which is a real reset and therefore a second coprocessor boot. That is
+# verified, and a cold power cycle is NOT required; this file said it was, for weeks, on no
+# evidence. If the ports are missing anyway, contrib/npuep/reload.sh pulses and then waits for the
+# endpoint the way this hook does not.
 
 : ${MODULE:=/boot/modules/npuep.ko}
 : ${FIRST_IF:=npup1}

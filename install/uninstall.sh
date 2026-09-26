@@ -20,8 +20,8 @@ if kldstat -q -n npuep; then
     echo "    itself, so freed vectors mean its writes land on whatever replaces them)"
 fi
 
-rm -f "${PREFIX}/etc/rc.syshook.d/early/01-npuctl"
-rm -f "${PREFIX}/etc/rc.syshook.d/early/02-npuep"
+rm -f "${PREFIX}/etc/rc.syshook.d/early/06-npuctl"
+rm -f "${PREFIX}/etc/rc.syshook.d/early/07-npuep"
 
 # And the module, so the next boot cannot load a driver whose plugin is gone. The source is
 # untouched - it lives in the repository, not here.

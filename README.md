@@ -71,7 +71,7 @@ its own cannot be answered** — three remedies were tried and measured not to h
 datapath down with `PF_DISABLE`/`PF_CLOSE`, which the device accepts and which changes nothing;
 retracting the stale handshake; and waiting thirty seconds instead of four.
 
-What restores it is a coprocessor reboot, and the host can cause one itself. `01-npuctl` pulses the
+What restores it is a coprocessor reboot, and the host can cause one itself. `06-npuctl` pulses the
 reset line, and that pulse is a real reset rather than a release — so **a pulse followed by a
 reload brings everything back with no power cycle.** Verified, twice in a row: fourteen
 interfaces, the forwarding tables read back and confirmed, `nwa: 14 of 14 ports up`, and a front
@@ -130,15 +130,28 @@ cd os-npuctl
 
 The installer puts in place two early boot hooks and, if a module has been built, installs it:
 
-- `01-npuctl` pulses the coprocessor out of reset. It comes out of power-on **held**, and nothing
+- `06-npuctl` pulses the coprocessor out of reset. It comes out of power-on **held**, and nothing
   in OPNsense releases it — which is why the appliance boots with a silent coprocessor and no
   ports.
-- `02-npuep` loads the driver and waits for the interfaces to appear, because every early hook
+- `07-npuep` loads the driver and waits for the interfaces to appear, because every early hook
   runs before OPNsense configures its interfaces and one that returns too soon leaves them out of
   that pass.
 
 The kernel module is **built on the appliance**, not packaged: it is C against that kernel's
-headers. `contrib/npuep/build.sh` builds it; the installer then copies it to `/boot/modules`.
+headers. `contrib/npuep/fetch-sources.sh` fetches the sources that match the running kernel,
+pinned to the commit the kernel names in `uname -v`; `contrib/npuep/build.sh` builds against them
+and stamps the result with the kernel it was built for; the installer copies both to
+`/boot/modules`.
+
+That stamp is not bookkeeping. A module's kernel dependency is a range running to the end of its
+branch, so a module built for the wrong 15.x kernel **loads without complaint** rather than being
+refused — the loud failure this project was designed around does not arrive. `install/verify.sh`
+compares the stamp instead, and `compat.json` records `kern_version` rather than the version
+labels, which do not move when OPNsense ships a kernel set inside a series.
+
+Both hooks are numbered above OPNsense's own `05-upgrade`, which finalises a pending firmware set
+and reboots from inside the early boot sequence. Numbered below it, as `01` and `02`, this code
+brought the coprocessor up and then had the machine rebooted underneath it.
 
 It cannot be preloaded from `loader.conf`, and not for one reason but two — the reset pulse has
 not happened at that point, so there is no live device to attach to, and the BAR restore this
