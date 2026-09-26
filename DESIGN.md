@@ -25,7 +25,7 @@ it over PCIe.
 ## The stages, and where the line is now
 
 ```
- 1   release the NPU from reset           DONE     src/etc/rc.syshook.d/early/01-npuctl
+ 1   release the NPU from reset           DONE     src/etc/rc.syshook.d/early/06-npuctl
  2   complete the facility handshake      DONE     contrib/npuep/npuep.c
  3   the management interface, mvmgmt0    WORKING  contrib/npuep/npumgmt.c
  4a  the AGNIC command channel            WORKING  contrib/npuep/npugiu.c
@@ -34,7 +34,7 @@ it over PCIe.
  4d  the 66-byte header, both directions  WORKING  contrib/npuep/npugiu.c
  4e  per-port control, the nwa mailbox    WORKING  contrib/npuep/npunwa.c
  4f  the rpc channel and the tables       WORKING  contrib/npuep/npurpc.c
- 5   loading at boot                      WORKING  src/etc/rc.syshook.d/early/02-npuep
+ 5   loading at boot                      WORKING  src/etc/rc.syshook.d/early/07-npuep
  6   assignment in OPNsense               not started
 ```
 
@@ -60,7 +60,7 @@ its own cannot be answered.** Three remedies were tried and measured not to help
 `PF_DISABLE`/`PF_CLOSE`, which the device accepts and which changes nothing; retracting the stale
 handshake; and waiting thirty seconds instead of four.
 
-What restores it is a coprocessor reboot, and the host owns the means: `01-npuctl` pulses the
+What restores it is a coprocessor reboot, and the host owns the means: `06-npuctl` pulses the
 reset line, and the pulse is a reset rather than a release. **Verified: a pulse followed by a
 reload brings back all fourteen interfaces, the forwarding tables and the network agent, with no
 power cycle** - `nwa: 14 of 14 ports up`, and a front port brought up with no address counted
@@ -85,7 +85,7 @@ the table is complete at fourteen. The cookie is not a commit - it is in place b
 are - so `npuep_wait_barmap` polls for the facilities it needs rather than for the cookie, up to
 two minutes, and goes on with whatever is published if it runs out.
 
-That timing is also why none of this showed at boot: `01-npuctl` pulses reset there too, but a
+That timing is also why none of this showed at boot: `06-npuctl` pulses reset there too, but a
 minute of other boot work happens before the module loads, so the table is long finished. The
 defect was invisible on the only path that was ever run.
 
@@ -220,3 +220,86 @@ zeros immediately before the load and correct immediately after.
 does nothing on unrecognised hardware, and cannot hurt the host. The module allocates interrupt
 vectors and invites a coprocessor to use host memory. Only the first belongs in an unattended
 boot path.
+
+## Where the hooks sit in the boot sequence
+
+The hooks are `06-npuctl` and `07-npuep`, and both numbers are chosen rather than inherited.
+They were `01` and `02` until an audit of the update path asked what runs between them and
+OPNsense configuring its interfaces. The answer is OPNsense's own `05-upgrade`, which is this,
+in full:
+
+```sh
+for STAGE in K B P; do
+	if opnsense-update -${STAGE}; then echo "Rebooting now."; reboot; fi
+done
+```
+
+It finalises a pending firmware set and reboots from inside the early sequence. Numbered ahead of
+it, this project brought the coprocessor up, loaded the driver and let the endpoint start bus
+mastering - and then that hook rebooted the machine underneath it, unattended, with nothing given
+the chance to unload. Numbered after it the interaction does not exist, and it costs nothing on an
+ordinary boot, because `opnsense-update` finds nothing pending and returns.
+
+## Shutdown is not detach
+
+`device_shutdown` was missing for the whole life of this driver, and nothing revealed it.
+
+FreeBSD calls `device_detach` on `kldunload`. It does not call it on `reboot` - it calls
+`device_shutdown`, and a driver that declares none is simply skipped. So every reboot left the
+endpoint bus mastering, with its MSI-X vectors armed and the ring addresses this kernel had
+published still live, writing received frames and doorbell messages into physical memory the next
+kernel was about to hand to something else.
+
+`docs/porting-notes.md` already described that symptom class under a different trigger: a fault in
+an unrelated subsystem, some minutes later, with no device errors logged in between. The teardown
+that prevents it had been written, carefully, and left reachable only from a path that a reboot
+never takes.
+
+The quiescing half of detach is now a function of its own - withdraw the facilities newest first,
+stop the heartbeat, clear `HOST_INIT` and `HOST_ALIVE`, disable bus mastering - and `device_detach`
+and `device_shutdown` both call it. Detach goes on to hand the resources back. Shutdown does not,
+because the machine is about to stop caring about them.
+
+## Which kernel sources the module is built against
+
+OPNsense ships no kernel sources and no package provides them, so this appliance had a 333MB
+`/usr/src/sys` that somebody had copied there once. It built, so nobody asked what it was.
+
+It was the wrong tree. It was stock FreeBSD 15.1-RELEASE, `BRANCH="RELEASE"`, while the kernel is
+OPNsense's own build of 15.1-RELEASE-p1 from `github.com/opnsense/src`. The two differ in 156
+files.
+
+That the module worked anyway was luck, and the only way to know it was luck rather than
+correctness was to fetch the right tree and rebuild against it. `__FreeBSD_version` is `1501000` in
+both, none of the 156 differing files is in a path this driver includes, and **the two builds came
+out byte-identical**. A good outcome, and not a reason to go on guessing - the next kernel is under
+no obligation to be as kind.
+
+The kernel names its own commit, so the sources can be pinned to exactly what is running with no
+version file to keep in step:
+
+```
+FreeBSD 15.1-RELEASE-p1 stable/26.7-n283674-12334a596709 SMP
+                                             ^^^^^^^^^^^^ the commit in opnsense/src
+```
+
+`contrib/npuep/fetch-sources.sh` does that, and prints the `SYSDIR` to build with. Run it *after*
+the reboot that brings a new kernel up, not before: `uname -v` reports the running kernel, so
+beforehand it pins the old one perfectly and uselessly.
+
+## A mismatch does not announce itself
+
+The assumption underneath `compat.json`, `upstream.yml` and `verify.sh` was that a module built
+for the wrong kernel would be refused at load time, loudly, with a message naming the cause.
+
+It would not. A module's kernel dependency is a **range** - from the `__FreeBSD_version` it was
+compiled against to the end of that branch - so a module built for 15.1 loads cleanly into any
+later 15.x kernel. Nothing is printed, nothing fails, and any structure that moved is read at the
+wrong offset.
+
+So the mismatch is caught out of band instead. `contrib/npuep/build.sh` writes the kernel it built
+against into `npuep.ko.kernel`, the installer carries that stamp to `/boot/modules` beside the
+module, and `verify.sh` compares strings. `compat.json` records `kern_version` for the same reason:
+OPNsense ships kernel sets *within* a series, so 26.7 -> 26.7.4 replaces `/boot/kernel` while
+leaving both "OPNsense 26.7" and "FreeBSD 15.1-RELEASE-p1" untouched. The labels do not move. The
+commit does.

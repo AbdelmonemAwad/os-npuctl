@@ -1,6 +1,20 @@
 #!/bin/sh
-# Release the Marvell NPU from reset. Numbered 01 so it runs before every other early hook:
-# on these boards there are no network interfaces at all until this has happened.
+# Release the Marvell NPU from reset. Numbered 06, and the number is load-bearing in both
+# directions.
+#
+# It must run before OPNsense configures its interfaces, because on these boards there are none at
+# all until it has. And it must run AFTER OPNsense's own 05-upgrade, which is, in full:
+#
+#     for STAGE in K B P; do
+#         if opnsense-update -${STAGE}; then echo "Rebooting now."; reboot; fi
+#     done
+#
+# That hook finalises a pending firmware update and reboots from inside the early sequence. Run
+# ahead of it - which these hooks did, as 01 and 02 - and the coprocessor is live and bus-mastering
+# into host memory when that reboot fires, writing received frames into physical addresses the next
+# kernel is about to hand to something else. docs/porting-notes.md records that symptom class under
+# a different trigger: a fault in an unrelated subsystem, minutes later, with nothing logged in
+# between. Running after 05-upgrade costs nothing on an ordinary boot and removes the interaction.
 #
 # On a Sophos XGS the NPU owns every front port, and it comes out of power-on HELD: the MCP2210
 # USB-to-SPI bridge loads its factory NVRAM pin state, which for the 126/136 is GP3=1, GP5=0,

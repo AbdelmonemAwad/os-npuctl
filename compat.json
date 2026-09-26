@@ -2,22 +2,39 @@
   "_comment": [
     "What this was last verified against, and the reason the file exists.",
     "",
-    "The kernel module in contrib/npuep is C against one kernel's headers. When OPNsense moves to",
-    "a new FreeBSD, the installed module stops loading - and because the boot hook is written to",
-    "exit 0 rather than block a boot, the appliance comes up quietly with no front ports. The",
-    "silence is deliberate and it is also how this would go unnoticed.",
+    "The kernel module in contrib/npuep is C against one kernel's headers. When OPNsense ships a",
+    "new kernel the installed module is no longer the right one - and because the boot hook is",
+    "written to exit 0 rather than block a boot, the appliance comes up quietly with no front",
+    "ports. The silence is deliberate and it is also how this would go unnoticed.",
     "",
-    "So: .github/workflows/upstream.yml watches for a new OPNsense release and raises an issue",
-    "when one appears, and install/verify.sh is what to run on the appliance afterwards. Update",
-    "the fields below only after verify.sh passes on real hardware."
+    "WHAT TO COMPARE, AND WHAT NOT TO. The first two fields below are labels. They are what a",
+    "human reads and they are NOT what breaks: OPNsense ships kernel sets inside a series, so",
+    "26.7 -> 26.7.4 changes /boot/kernel while leaving 'OPNsense 26.7' and 'FreeBSD",
+    "15.1-RELEASE-p1' both untouched. That happened here, and the labels did not move an inch.",
+    "kern_version is the field to compare, because it carries the source commit the kernel was",
+    "built from and nothing else in the system does.",
+    "",
+    "Nor does a mismatch announce itself at load time. A module declares its kernel dependency as",
+    "a RANGE - from the __FreeBSD_version it was built against to the end of that branch - so a",
+    "module built for 15.1 loads without complaint into any later 15.x kernel. The loud refusal",
+    "this project once expected does not arrive; the module loads and reads any structure that",
+    "moved at the wrong offset. contrib/npuep/build.sh therefore stamps the module with the",
+    "kernel it was built against, and install/verify.sh compares the stamp rather than probing.",
+    "",
+    "So: .github/workflows/upstream.yml watches for a new OPNsense release and raises an issue,",
+    "and install/verify.sh is what to run on the appliance afterwards. Update the fields below",
+    "only after verify.sh passes on real hardware."
   ],
   "opnsense": "26.7",
   "freebsd": "15.1-RELEASE-p1",
+  "kern_version": "FreeBSD 15.1-RELEASE-p1 stable/26.7-n283674-12334a596709 SMP",
+  "kern_osreldate": 1501000,
+  "kernel_sources": "github.com/opnsense/src at 12334a596709, fetched by contrib/npuep/fetch-sources.sh",
   "verified_on": "2026-09-26",
   "board": "Sophos XGS 136, assembly AMDA0201, Marvell CN9131, 14 ports",
   "verified_how": "install/verify.sh on the appliance, after a cold boot, with the driver loaded by the boot hook",
   "version_sensitive": [
-    "contrib/npuep/*.c - rebuild required on any FreeBSD version change",
-    "src/etc/rc.syshook.d/early/* - depends on OPNsense running early syshooks before it configures interfaces"
+    "contrib/npuep/*.c - rebuild required on any kernel change, which means any change to kern_version and not merely to the two labels above",
+    "src/etc/rc.syshook.d/early/* - depends on OPNsense running early syshooks before it configures interfaces, and on being numbered after OPNsense's own 05-upgrade"
   ]
 }

@@ -34,27 +34,45 @@ printf '  board: %s / %s\n' "$(kenv smbios.planar.maker 2>/dev/null)" "$(kenv sm
 
 echo
 echo "== what is installed =="
-for f in /usr/local/etc/rc.syshook.d/early/01-npuctl /usr/local/etc/rc.syshook.d/early/02-npuep; do
+for f in /usr/local/etc/rc.syshook.d/early/06-npuctl /usr/local/etc/rc.syshook.d/early/07-npuep; do
     if [ -x "$f" ]; then ok "$(basename $f) present and executable"; else bad "$f missing or not executable"; fi
 done
 if [ -f /boot/modules/npuep.ko ]; then ok "the module is installed in /boot/modules"; else bad "/boot/modules/npuep.ko missing - the boot hook will skip and there will be no front ports"; fi
 
 echo
 echo "== does the module match this kernel =="
-# The check that matters after an update. kldload reports a version mismatch rather than loading,
-# and the message is the one thing that names the real cause.
+# The check that matters after an update, and it loads nothing.
+#
+# It used to run `kldload -n /boot/modules/npuep.ko`, on the belief - written into the comment
+# that used to be here - that kldload reports a version mismatch rather than loading. It does
+# not. There is no dry run; -n means "do not load if it is already loaded", and this branch only
+# runs when it is not. So the check LOADED the module. On a firewall, from a script whose own
+# header promises that it changes nothing. And when that load succeeded, every check after it
+# passed - so a boot that had failed was reported as a healthy chain, which is the one
+# circumstance this file exists to catch.
+#
+# It cannot be done by trying the load anyway. A module's kernel dependency is a RANGE, from the
+# __FreeBSD_version it was built against to the end of that branch, so a module built for 15.1
+# loads cleanly into any later 15.x kernel rather than being refused. The mismatch has to be
+# caught out of band, by comparing the stamp contrib/npuep/build.sh writes beside the module.
 if kldstat -q -n npuep; then
     ok "npuep is loaded"
+elif [ ! -f /boot/modules/npuep.ko ]; then
+    bad "npuep is NOT loaded and there is no module in /boot/modules to load"
 else
     bad "npuep is NOT loaded"
-    if [ -f /boot/modules/npuep.ko ]; then
-        out=$(kldload -n /boot/modules/npuep.ko 2>&1)
-        case "$out" in
-            *version*|*KLD*|*unsupported*)
-                bad "it was built for a different kernel - rebuild it: sh contrib/npuep/build.sh"
-                printf '        %s\n' "$out" ;;
-            *) [ -n "$out" ] && printf '        %s\n' "$out" ;;
-        esac
+    built=$(cat /boot/modules/npuep.ko.kernel 2>/dev/null)
+    now=$(uname -v)
+    if [ -z "${built}" ]; then
+        note "no build stamp beside the module, so this cannot tell whether it matches"
+        note "to see why it did not load: kldload /boot/modules/npuep.ko"
+    elif [ "${built}" != "${now}" ]; then
+        bad "it was built against a different kernel - rebuild: sh contrib/npuep/build.sh"
+        printf '        built  : %s\n' "${built}"
+        printf '        running: %s\n' "${now}"
+    else
+        note "it matches this kernel, so it failed to load for some other reason"
+        note "to see it: kldload /boot/modules/npuep.ko"
     fi
 fi
 
