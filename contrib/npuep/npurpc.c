@@ -51,7 +51,27 @@
 #define	NPURPC_HI_DESC_COUNT	32
 
 /* How much of a hand-written command, and of its answer, the workbench sysctl will carry. */
-#define	NPURPC_RAW_MAX		64
+/*
+ * The hand-command buffer. 64 was enough for the three commands this driver sends and far too
+ * small for the ones worth asking: the fastpath's counter tables answer with an array of u64, and
+ * the counters that say why a frame was dropped are spread from 23 to 42 - so a 64-byte cap
+ * returned the first eight and silently truncated the rest, which is a good way to read a zero
+ * and believe it.
+ */
+#define	NPURPC_RAW_MAX		512
+
+/*
+ * The formatted answer: the header text plus three characters per response byte.
+ *
+ * It is malloc'd, not automatic, and that is the whole point of naming it here. When
+ * NPURPC_RAW_MAX was widened from 64 to 512 so the fastpath's counter tables could be read whole,
+ * this string grew with it to about 1.8KB - and with in[400] and pl[512] beside it the frame came
+ * to roughly 2.7KB in one function. The machine panicked on the first command sent afterwards.
+ *
+ * npunwa_sysctl_probe carries a comment warning about exactly this, written in an earlier session
+ * and not read before the mistake was repeated here.
+ */
+#define	NPURPC_CMD_OUT		(NPURPC_RAW_MAX * 3 + 256)
 
 /* How long to wait for the target to accept the configuration, in hundredths of a second. */
 #define	NPURPC_OPEN_WAIT	500
@@ -723,7 +743,7 @@ npurpc_sysctl_command(SYSCTL_HANDLER_ARGS)
 {
 	struct npurpc_softc *sc = arg1;
 	uint8_t pl[NPURPC_RAW_MAX];
-	char in[400], out[900], *q, *end;
+	char in[400], *out = NULL, *q, *end;
 	unsigned long v;
 	int err, n = 0, i, k = 0, cmd = -1;
 
@@ -778,21 +798,29 @@ report:
 		RPC_UNLOCK(sc);
 		return (sysctl_handle_string(oidp, "nothing sent yet", 17, req));
 	}
-	k = snprintf(out, sizeof(out), "command %u, %d payload bytes -> %s",
+	RPC_UNLOCK(sc);
+
+	/* M_WAITOK can sleep, so it happens with no lock held. */
+	out = malloc(NPURPC_CMD_OUT, M_DEVBUF, M_WAITOK);
+
+	RPC_LOCK(sc);
+	k = snprintf(out, NPURPC_CMD_OUT, "command %u, %d payload bytes -> %s",
 	    sc->raw_cmd, sc->raw_plen,
 	    sc->raw_err != 0 ? "no answer" : "answered");
 	if (sc->raw_err != 0)
-		k += snprintf(out + k, sizeof(out) - k, " (errno %d)", sc->raw_err);
+		k += snprintf(out + k, NPURPC_CMD_OUT - k, " (errno %d)", sc->raw_err);
 	else {
-		k += snprintf(out + k, sizeof(out) - k, ", rc %#x%s, %d bytes back:",
+		k += snprintf(out + k, NPURPC_CMD_OUT - k, ", rc %#x%s, %d bytes back:",
 		    sc->raw_rc, (sc->raw_rc & RPC_RC_ERRNO) ?
 		    " (an errno, so the target refused it)" : "", sc->raw_rlen);
-		for (i = 0; i < sc->raw_rlen && k < (int)sizeof(out) - 6; i++)
-			k += snprintf(out + k, sizeof(out) - k, " %02x", sc->raw_resp[i]);
+		for (i = 0; i < sc->raw_rlen && k < NPURPC_CMD_OUT - 6; i++)
+			k += snprintf(out + k, NPURPC_CMD_OUT - k, " %02x", sc->raw_resp[i]);
 	}
 	RPC_UNLOCK(sc);
 
-	return (sysctl_handle_string(oidp, out, sizeof(out), req));
+	err = sysctl_handle_string(oidp, out, NPURPC_CMD_OUT, req);
+	free(out, M_DEVBUF);
+	return (err);
 }
 
 static int
