@@ -1,0 +1,110 @@
+name: upstream
+
+# Watch for a new OPNsense release, because one of them will break this and nothing else will say so.
+#
+# The kernel module is built against one kernel's headers. When OPNsense moves to a new FreeBSD,
+# the installed module stops loading - and the boot hook is deliberately written to exit 0 rather
+# than block a boot, so the appliance comes up quietly with no front ports and no error anyone
+# would connect to an update they applied last week.
+#
+# This job cannot detect that. There is no Sophos appliance on a GitHub runner. What it CAN do is
+# notice that upstream moved and say so while the reason is still obvious, so that
+# install/verify.sh gets run on the hardware before the next reboot rather than after it.
+#
+# It compares the latest tag of opnsense/core against compat.json, which records what this was
+# last verified against. Change compat.json only when verify.sh has passed on real hardware.
+
+on:
+  schedule:
+    # Weekly. OPNsense ships roughly every six months with point releases between, so this is far
+    # more often than it needs to be - which is the right side to err on for a check whose whole
+    # job is to not be late.
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    name: is upstream still where we left it
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare the latest OPNsense release with compat.json
+        id: compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+
+          tested=$(python3 -c "import json;print(json.load(open('compat.json'))['opnsense'])")
+          echo "tested against: ${tested}"
+
+          # The release list rather than "latest": OPNsense tags business editions and release
+          # candidates too, and "latest" is whichever was marked so, not necessarily the newest
+          # thing a user would install.
+          latest=$(gh api repos/opnsense/core/releases --jq '[.[] | select(.prerelease == false) | .tag_name] | first' 2>/dev/null || echo "")
+          if [ -z "${latest}" ]; then
+            echo "could not read the release list; not failing the job over a transient API error"
+            echo "moved=no" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "upstream latest: ${latest}"
+
+          # Compare on the major.minor only. Point releases do not move FreeBSD and are not what
+          # this is guarding against; a new minor is.
+          norm() { echo "$1" | sed -E 's/^v//; s/^([0-9]+\.[0-9]+).*/\1/'; }
+          if [ "$(norm "${latest}")" = "$(norm "${tested}")" ]; then
+            echo "still ${tested} - nothing to do"
+            echo "moved=no" >> "$GITHUB_OUTPUT"
+          else
+            echo "moved=yes" >> "$GITHUB_OUTPUT"
+            echo "latest=${latest}" >> "$GITHUB_OUTPUT"
+            echo "tested=${tested}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Raise an issue, once
+        if: steps.compare.outputs.moved == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST: ${{ steps.compare.outputs.latest }}
+          TESTED: ${{ steps.compare.outputs.tested }}
+        run: |
+          set -eu
+          title="OPNsense ${LATEST} is out; this is verified against ${TESTED}"
+
+          # Do not reopen the same conversation every Monday.
+          existing=$(gh issue list --state open --search "in:title \"${title}\"" --json number --jq '.[0].number' 2>/dev/null || echo "")
+          if [ -n "${existing}" ]; then
+            echo "issue #${existing} is already open"
+            exit 0
+          fi
+
+          gh issue create --title "${title}" --label upstream --body "$(cat <<EOF
+Upstream moved to **${LATEST}**. \`compat.json\` records **${TESTED}**.
+
+This is not a failure - it is the point at which the kernel module stops being known to work.
+
+**What actually breaks.** \`contrib/npuep\` is C against one kernel's headers. If this release
+carries a different FreeBSD, the installed \`/boot/modules/npuep.ko\` will not load. The boot hook
+\`02-npuep\` then exits 0 by design, because a firewall that boots late is better than one that
+does not boot - so the appliance comes up with **no front ports and no error that points here**.
+
+**Before updating the appliance**
+
+1. Note the FreeBSD version the new release carries.
+2. Keep console access. If the front ports are the appliance's only path in, an update that
+   breaks the module locks you out of everything but the serial console.
+
+**After updating**
+
+1. \`sh contrib/npuep/build.sh\` on the appliance, then reinstall: \`./install/install.sh\`.
+2. **Cold power cycle.** The datapath attaches once per coprocessor boot, so a rebuilt module is
+   not enough on its own - the coprocessor has to restart. A cold cycle is the verified way.
+3. \`sh install/verify.sh\` and read every line.
+4. Only when that passes, update \`compat.json\` and close this issue.
+EOF
+)"

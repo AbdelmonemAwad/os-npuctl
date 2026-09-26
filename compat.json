@@ -1,0 +1,23 @@
+{
+  "_comment": [
+    "What this was last verified against, and the reason the file exists.",
+    "",
+    "The kernel module in contrib/npuep is C against one kernel's headers. When OPNsense moves to",
+    "a new FreeBSD, the installed module stops loading - and because the boot hook is written to",
+    "exit 0 rather than block a boot, the appliance comes up quietly with no front ports. The",
+    "silence is deliberate and it is also how this would go unnoticed.",
+    "",
+    "So: .github/workflows/upstream.yml watches for a new OPNsense release and raises an issue",
+    "when one appears, and install/verify.sh is what to run on the appliance afterwards. Update",
+    "the fields below only after verify.sh passes on real hardware."
+  ],
+  "opnsense": "26.7",
+  "freebsd": "15.1-RELEASE-p1",
+  "verified_on": "2026-09-26",
+  "board": "Sophos XGS 136, assembly AMDA0201, Marvell CN9131, 14 ports",
+  "verified_how": "install/verify.sh on the appliance, after a cold boot, with the driver loaded by the boot hook",
+  "version_sensitive": [
+    "contrib/npuep/*.c - rebuild required on any FreeBSD version change",
+    "src/etc/rc.syshook.d/early/* - depends on OPNsense running early syshooks before it configures interfaces"
+  ]
+}

@@ -22,7 +22,7 @@ The host has **no network hardware of its own**. Every port on the front panel b
 coprocessor, and the only way to reach them is to get the coprocessor running and then speak to
 it over PCIe.
 
-## Four stages, and where the line is
+## The stages, and where the line is now
 
 ```
  1   release the NPU from reset           DONE     src/etc/rc.syshook.d/early/01-npuctl
@@ -30,21 +30,58 @@ it over PCIe.
  3   the management interface, mvmgmt0    WORKING  contrib/npuep/npumgmt.c
  4a  the AGNIC command channel            WORKING  contrib/npuep/npugiu.c
  4b  traffic classes, queues, buffers     WORKING  contrib/npuep/npugiu.c
- 4c  a netdev on the trunk                not started
- 4d  the 66-byte header, 14 interfaces    not started
- 4e  per-port control, the nwa mailbox    specified, one question open
+ 4c  fourteen netdevs on the trunk        WORKING  contrib/npuep/npugiu.c
+ 4d  the 66-byte header, both directions  WORKING  contrib/npuep/npugiu.c
+ 4e  per-port control, the nwa mailbox    WORKING  contrib/npuep/npunwa.c
+ 4f  the rpc channel and the tables       WORKING  contrib/npuep/npurpc.c
+ 5   loading at boot                      WORKING  src/etc/rc.syshook.d/early/02-npuep
+ 6   assignment in OPNsense               not started
 ```
 
-Stages 1 to 4b are in this repository as working code, verified on the hardware. `mvmgmt0`
-carries traffic with no loss in either direction; the GIU command channel answers
-`CC_PF_MGMT_ECHO`; the coprocessor accepts the whole seven-command bring-up sequence and has
-begun sending its periodic keep-alive unprompted, which is the first thing it has ever said on
-its own initiative.
+**The front ports carry traffic in both directions.** Measured with three cables in, frames
+arriving on three ports at once and each landing on its own interface, and a full ARP exchange
+completing over a switch port and over a SoC port. That is the line that moved.
 
-What is left is 4c through 4e. The first two are ordinary work against a specification that is
-complete - [docs/giu.md](docs/giu.md). The third is a separate facility with its own protocol,
-read off a live system and written up in [docs/netagent.md](docs/netagent.md), where one question
-remains: how a request is signalled to a far side that has no doorbell.
+Stage 4e's open question - how a request is signalled to a far side with no doorbell - is
+answered: a turn register the host writes rather than a doorbell, `NWA_TURN` at offset `0x18`.
+
+Stage 4f did not exist when this was first written. Receive needs the coprocessor's own
+forwarding tables filled in, and that is a fifth facility with its own protocol - see
+[docs/rpc.md](docs/rpc.md). It is where most of the difficulty turned out to be.
+
+What is left is stage 6: the interfaces exist and carry traffic, but until they are assigned in
+OPNsense they are outside the firewall's own configuration and pf has no rules for them.
+
+### Three limits that are properties of the hardware
+
+**The datapath attaches once per coprocessor boot.** The device waits for `HOST_MGMT_READY`
+once, answers once, and then spends the rest of its life in its command loop. **A module reload on
+its own cannot be answered.** Three remedies were tried and measured not to help:
+`PF_DISABLE`/`PF_CLOSE`, which the device accepts and which changes nothing; retracting the stale
+handshake; and waiting thirty seconds instead of four.
+
+What restores it is a coprocessor reboot, and the host owns the means: `01-npuctl` pulses the
+reset line, and the pulse is a reset rather than a release. A cold power cycle is verified to
+restore everything. A warm reboot runs that same hook, so it probably does too - **untested**, and
+this file previously stated the stronger claim without evidence. Narrow the claim before designing
+around it.
+
+**Loading the driver while the endpoint is in reset hangs the host.** Measured: a reset pulse, a
+forty-five second wait and a `kldload` stopped the machine dead - no panic, no console output,
+nothing. A PCIe read to an endpoint in reset neither completes nor times out. Nothing in the
+driver checks that the device is alive before its first read; it waits for `DEV_READY` only after
+reading the barmap. That is a hazard at every boot, and fixing it is what would make a
+pulse-then-reload cycle safe.
+
+**Programming the forwarding tables races the coprocessor's own startup.** Its userspace fastpath
+starts in response to this host's handshake and zeroes the whole logical-interface table about
+thirteen seconds later. Commands sent before that are accepted, answered `rc 0`, and erased. So
+programming runs on a thread, reads back, and repeats until the read agrees.
+
+**The device's own packet counters are unavailable.** `GET_STATISTICS` is answered at full length
+with zeros - it is the physical packet processor's block, and a function with no physical port has
+none. `GET_GP_STATS` is not implemented by this firmware at all. The driver reports its own counts
+and says so, because a zero that reads like a measurement is worse than an admission.
 
 ### Stage 1 - reset
 

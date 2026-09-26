@@ -17,6 +17,7 @@ echo "== tools =="
 install -d -m 0755 "${PREFIX}/opnsense/scripts/npuctl"
 install -m 0755 "${SRC}/src/opnsense/scripts/npuctl/mcp2210.py" "${PREFIX}/opnsense/scripts/npuctl/"
 install -m 0755 "${SRC}/src/opnsense/scripts/npuctl/npuhs.py" "${PREFIX}/opnsense/scripts/npuctl/"
+install -m 0755 "${SRC}/install/verify.sh" "${PREFIX}/opnsense/scripts/npuctl/verify.sh"
 
 echo "== boot hook =="
 install -d -m 0755 "${PREFIX}/etc/rc.syshook.d/early"
