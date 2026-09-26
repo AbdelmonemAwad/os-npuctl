@@ -244,16 +244,57 @@ it matters rather than before.
 `PortF1` and `PortF2` are the SFP cages and remain **untested**: a copper patch lead cannot loop a
 fibre cage, and no module was to hand.
 
-#### Link state is only reported for the SoC ports
+#### Link state, and the one line that hid it
 
-The network agent reports carrier for the four SoC ports and has never once reported it for any of
-the ten switch ports - not while a switch port was demonstrably linked and passing frames, and not
-when a cable was plugged into one. `nwa: 14 of 14 ports up` at attach shows the agent is
-addressing all fourteen for the bring-up command, so this is specific to link state.
+The network agent reported carrier for the four SoC ports and never once for any of the ten switch
+ports - not while a switch port was linked and passing frames, and not when a cable was plugged
+into one. `nwa: 14 of 14 ports up` at attach showed the agent was addressing all fourteen for the
+bring-up command, so it was specific to link state.
 
-The consequence is not cosmetic: `ifconfig` shows no `status:` line for the ten switch ports, so
-OPNsense cannot see a cable being plugged into one, and neither can a human reading the output.
-Open.
+It was arithmetic, in `npunwa_command`. The reply length counts **bytes** and includes an
+eight-byte header, so a one-byte answer is nine. Dividing the payload by four and truncating gave
+**zero words**: nothing was read and the caller was handed a zero, which is indistinguishable from
+a definite answer of "no carrier".
+
+The two families are answered by different code on the far side, and that is why only one of them
+worked. The ten switch ports go through UMSD, whose `npu_port_state_get` sets
+`ret_data.size = sizeof(param.state)` on a `u8` - nine bytes, zero words, always down. The four
+SoC ports are answered by NetAgent itself with a four-byte state - twelve bytes, one word, fine.
+Port9 reporting carrier while Port1 never did was not a property of the hardware.
+
+The vendor's own host rounds up: `NWA_NUM_DATA_CHUNCK(len)` is `NWA_PCI_ALIGN(len) / 4`.
+
+Rounding up then requires masking. The last word read may contain bytes the far side never wrote,
+the window belongs to another processor, and the link poll tests the whole word as `(v != 0)` - so
+a port would have read as up on the strength of somebody else's leftovers. The mask is applied in
+`npunwa_command`, which fixes every caller at once and needs no per-attribute knowledge of field
+widths.
+
+#### Knowing is not telling
+
+Reading the carrier correctly only put it in the log. Nothing told the network stack.
+
+`npugiu_init_locked` had been declaring every port `LINK_STATE_UP` the moment the datapath came
+up, which is how all fourteen showed a green plug in OPNsense's interface list from the moment the
+driver loaded, including the ten with nothing plugged into them. That facility moves frames; it
+has no idea whether a cable is in the socket. The claim is gone, the state now starts
+`LINK_STATE_UNKNOWN`, and `npugiu_link_change` is the seam the agent calls when it learns
+something. Verified with a temporary printf: indices 0, 2, 3 and 8 - exactly the four cabled ports
+- reached `if_link_state` 2, and the ten empty ones did not.
+
+This is not cosmetic. OPNsense drives gateway monitoring, failover and its `rc.linkup` hooks off
+link state, and a port that is always up is a port those mechanisms are blind to.
+
+#### Still open: there is no media layer
+
+`ifconfig` prints its `status:` line from `SIOCGIFMEDIA`, and this driver answers no media ioctl at
+all - so there is no `status: active` or `status: no carrier` on any of the fourteen, and no speed
+shown either. That is a separate gap from link state and it wants `ifmedia(9)`.
+
+Two hours went into chasing the wrong indicator first. `ifconfig` shows `0x1000000` on the USB
+adapters, and it is tempting to read that as a link flag; it is `IFF_NETLINK_1`, "used by netlink".
+**FreeBSD has no `IFF_LOWER_UP`** - that is a Linux flag - and link state is not visible in the
+flags word at all.
 
 ## Why the module is not loaded automatically
 

@@ -266,15 +266,42 @@ npunwa_xfer(struct npunwa_softc *sc, const uint32_t *req, int nreq, uint32_t *re
 	 * Read only as far as the far side says it wrote. Reading the whole buffer regardless
 	 * meant a thousand MMIO reads across the link for a nine-byte answer, on every single
 	 * probe - pointless traffic over a window another processor is also using.
+	 *
+	 * ROUND UP, and this is not a detail. The reply length counts BYTES and includes the
+	 * eight-byte header, so a one-byte answer is nine. Dividing the payload by four and
+	 * truncating gave zero words for it: the value was never read, the caller was handed a
+	 * zero, and it looked exactly like a definite answer of "no".
+	 *
+	 * That is what hid link state on the ten switch ports for the whole life of this driver.
+	 * The target's two handlers do not answer alike. The switch ports go through UMSD, whose
+	 * npu_port_state_get sets ret_data.size = sizeof(param.state), and param.state is a u8 -
+	 * so nine bytes, so zero words, so always "carrier down" and never a change to report.
+	 * The four SoC ports are answered by NetAgent itself with a four-byte state - twelve
+	 * bytes, one word - so they worked. Port9 reporting carrier while Port1 never did was not
+	 * a property of the hardware. It was this line.
+	 *
+	 * The vendor's own host rounds up: NWA_NUM_DATA_CHUNCK(len) is NWA_PCI_ALIGN(len) / 4.
+	 *
+	 * Then mask the tail. Rounding up means the last word read may contain bytes the far side
+	 * never wrote, and the window belongs to another processor, so those bytes are whatever it
+	 * left there. A caller that tests the whole word - the link poll does, as (v != 0) - would
+	 * read a port as up on the strength of somebody else's leftovers. Clearing them here fixes
+	 * every caller at once and needs no per-attribute knowledge of field widths.
 	 */
 	if (reply != NULL) {
-		int have = (int)nwa_rd(sc, NWA_REPLY_LEN);
+		int rlen = (int)nwa_rd(sc, NWA_REPLY_LEN);
+		int plen = (rlen > (int)NWA_RP_PAYLOAD) ? rlen - (int)NWA_RP_PAYLOAD : 0;
+		int want = (plen + 3) / 4;
+		int tail = plen & 3;
+		int have = want;
 
-		have = (have > (int)NWA_RP_PAYLOAD) ? (have - (int)NWA_RP_PAYLOAD) / 4 : 0;
 		if (have > nreply)
 			have = nreply;
 		for (i = 0; i < have; i++)
 			reply[i] = nwa_rd(sc, rb + NWA_RP_PAYLOAD + 4 * i);
+		/* Only if the partial word is one we actually read, rather than one nreply cut off. */
+		if (tail != 0 && have == want && have > 0)
+			reply[have - 1] &= (1U << (8 * tail)) - 1;
 		for (; i < nreply; i++)
 			reply[i] = 0;
 	}
@@ -440,6 +467,13 @@ npunwa_link_step(struct npunwa_softc *sc)
 			    p->media == 3 ? "fibre" : "copper",
 			    link ? "carrier up" : "carrier down");
 			p->link = link;
+			/*
+			 * And tell the stack, which is the whole point of knowing. Printing it to
+			 * the log told a human and left ifconfig, OPNsense's interface list, its
+			 * gateway monitoring and its rc.linkup hooks all believing every port was
+			 * up for ever.
+			 */
+			npugiu_link_change(n, link);
 		}
 	}
 
