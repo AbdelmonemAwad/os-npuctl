@@ -213,7 +213,6 @@ struct npugiu_port {
 	int			 link;		/* -1 unknown, 0 down, 1 up */
 	int			 speed;		/* megabits, 0 if not known */
 	int			 index;		/* into npuep_front_ports, for the nwa seam */
-	int			 promisc;	/* what the switch was last told */
 };
 
 struct npugiu_softc {
@@ -986,7 +985,8 @@ npugiu_init_locked(struct npugiu_port *pt)
 	 * up is a port those mechanisms are blind to.
 	 *
 	 * The network agent is the one thing that knows, and it calls npugiu_link_change below.
-	 * Until it does the state stays LINK_STATE_UNKNOWN, which is the honest answer.
+	 * Until it does the state stays where attach left it, which is DOWN - see the note there
+	 * for why that is the conservative claim and not UNKNOWN.
 	 */
 }
 
@@ -1083,9 +1083,7 @@ npugiu_ioctl(if_t ifp, u_long cmd, caddr_t data)
 	int err = 0;
 
 	switch (cmd) {
-	case SIOCSIFFLAGS: {
-		int want;
-
+	case SIOCSIFFLAGS:
 		GIU_LOCK(pt->sc);
 		if ((if_getflags(ifp) & IFF_UP) != 0)
 			npugiu_init_locked(pt);
@@ -1097,15 +1095,18 @@ npugiu_ioctl(if_t ifp, u_long cmd, caddr_t data)
 		 * sets IFF_PROMISC on every member for exactly the reason it matters here, so a
 		 * bridge over front ports forwards nothing but broadcast until this is passed on.
 		 *
+		 * This is a nudge and not the mechanism. It can arrive before the agent's mailbox is
+		 * usable - measured, on a bridge whose members OPNsense added eight seconds too early
+		 * - so the state that matters is reconciled from the link poll, and the error here is
+		 * deliberately not acted on. npunwa keeps the record of what the switch was told.
+		 *
 		 * OUTSIDE the lock, deliberately. npunwa_set_promisc waits on the agent's mailbox and
 		 * sleeps, and this driver has already panicked once on sleeping under this mutex.
 		 * An ioctl runs in a process context, so sleeping here is fine; sleeping there is not.
 		 */
-		want = (if_getflags(ifp) & (IFF_PROMISC | IFF_PPROMISC)) != 0;
-		if (want != pt->promisc && npunwa_set_promisc(pt->index, want) == 0)
-			pt->promisc = want;
+		(void)npunwa_set_promisc(pt->index,
+		    (if_getflags(ifp) & (IFF_PROMISC | IFF_PPROMISC)) != 0);
 		break;
-	}
 	case SIOCSIFMTU:
 		/*
 		 * Anything the device's own buffers can hold.
@@ -1178,7 +1179,6 @@ npugiu_attach_ifnet(struct npugiu_softc *sc)
 		pt->sc = sc;
 		pt->fp = fp;
 		pt->index = i;
-		pt->promisc = 0;
 		memcpy(pt->mac, sc->hostmac, sizeof(pt->mac));
 		pt->mac[5] = (uint8_t)(sc->hostmac[5] + fp->unit);
 
@@ -1203,6 +1203,32 @@ npugiu_attach_ifnet(struct npugiu_softc *sc)
 		ifmedia_set(&pt->media, IFM_ETHER | IFM_AUTO);
 		ether_ifattach(ifp, pt->mac);
 
+		/*
+		 * Undo ether_ifattach's 10 Mbit/s guess, and say DOWN rather than leaving the state
+		 * at the LINK_STATE_UNKNOWN if_alloc gives us.
+		 *
+		 * Both of these read as pedantic and neither is. if_bridge latches a member's RSTP
+		 * path cost once, inside bstp_create, at the moment the member is added - and
+		 * OPNsense adds all eight of ours seconds after this driver loads, which is well
+		 * before the network agent has published its window and told us a single thing about
+		 * carrier. So whatever we are claiming HERE is what the bridge believes for as long
+		 * as it lives.
+		 *
+		 * Measured, before this block existed: every member latched 2000000, the cost of a
+		 * 10 Mbit/s link, and stayed there while running at a gigabit. Deleting a member and
+		 * re-adding it by hand gave the right 20000, which is how the latch was found.
+		 *
+		 * bstp_calc_path_cost only arranges to try again - BSTP_PORT_PNDCOST - when it is
+		 * asked about a link that is DOWN. UNKNOWN is not down: it falls through, computes a
+		 * cost from whatever baudrate is there, and never revisits it. Saying UNKNOWN was
+		 * meant as honesty about a carrier nobody had reported yet, and it bought a wrong
+		 * number that could not be corrected. DOWN is both the conservative claim and the
+		 * one that leaves the door open: we have no evidence of a link, and the moment the
+		 * agent gives us one we say so.
+		 */
+		if_setbaudrate(ifp, 0);
+		if_link_state_change(ifp, LINK_STATE_DOWN);
+
 		GIU_LOCK(sc);
 		pt->ifp = ifp;
 		if ((fp->tag & 0x8000) != 0)
@@ -1212,6 +1238,26 @@ npugiu_attach_ifnet(struct npugiu_softc *sc)
 		GIU_UNLOCK(sc);
 	}
 	return (0);
+}
+
+/*
+ * Whether one front port's interface is asking for promiscuous mode.
+ *
+ * Read from the agent's link poll, which is the thing that can actually make it so and the only
+ * thing that will notice if an earlier attempt failed. Returns -1 when there is no interface to
+ * ask, which is not the same answer as no.
+ *
+ * No lock. if_getflags is a single load, an ifp is published once at attach and cleared once at
+ * detach, and a stale answer costs one wasted comparison on the next sweep a second later.
+ */
+int
+npugiu_promisc_wanted(int idx)
+{
+	struct npugiu_softc *sc = npugiu_sc;
+
+	if (sc == NULL || idx < 0 || idx >= NPUEP_NFRONT || sc->port[idx].ifp == NULL)
+		return (-1);
+	return ((if_getflags(sc->port[idx].ifp) & (IFF_PROMISC | IFF_PPROMISC)) != 0);
 }
 
 /*
@@ -1245,15 +1291,36 @@ void
 npugiu_link_change(int idx, int up, int speed)
 {
 	struct npugiu_softc *sc = npugiu_sc;
+	struct npugiu_port *pt;
 
 	if (sc == NULL || idx < 0 || idx >= NPUEP_NFRONT || sc->port[idx].ifp == NULL)
 		return;
 
-	sc->port[idx].link = up ? 1 : 0;
-	sc->port[idx].speed = up ? speed : 0;
+	pt = &sc->port[idx];
+	pt->link = up ? 1 : 0;
+	pt->speed = up ? speed : 0;
 
-	if_link_state_change(sc->port[idx].ifp,
-	    up ? LINK_STATE_UP : LINK_STATE_DOWN);
+	/*
+	 * Tell the kernel how fast the wire is, and do it BEFORE announcing the state change.
+	 *
+	 * ether_ifattach stamps IF_Mbps(10) on any interface that has not set this itself - "just a
+	 * default", says the comment beside it in if_ethersubr.c - and nothing here ever had. So
+	 * every one of the fourteen claimed 10 Mbit/s, and if_bridge's RSTP costed a gigabit port at
+	 * 2000000 where the 802.1D formula gives 20000. A factor of a hundred, in the direction that
+	 * makes the fastest link look worst: on a bridge holding both a 1G port and one of the two
+	 * 2.5G ones, that is enough to elect the wrong root port.
+	 *
+	 * The order is not cosmetic. bstp_ifupdstatus recalculates the cost from inside
+	 * if_link_state_change, so a baudrate set after the call would not be read until the next
+	 * time the link happened to bounce.
+	 *
+	 * ifmedia_baudrate answers 0 for IFM_AUTO, which is what npugiu_media_word returns when no
+	 * speed is known, and 0 is the right answer there: RSTP reads it as "unknown" and falls back
+	 * to its own default. 10 Mbit/s would have been a confident lie instead.
+	 */
+	if_setbaudrate(pt->ifp, ifmedia_baudrate(IFM_ETHER | npugiu_media_word(pt)));
+
+	if_link_state_change(pt->ifp, up ? LINK_STATE_UP : LINK_STATE_DOWN);
 }
 
 static void
