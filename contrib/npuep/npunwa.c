@@ -80,6 +80,7 @@
 struct npunwa_port {
 	uint32_t	id;
 	int		link;		/* last carrier we read, -1 if never read */
+	int		speed;		/* megabits, from the agent, 0 when dark */
 	int		media;		/* 3 fibre, 0 copper, -1 unknown */
 	int		up;		/* we commanded it up */
 };
@@ -553,8 +554,17 @@ npunwa_link_step(struct npunwa_softc *sc)
 			 * the log told a human and left ifconfig, OPNsense's interface list, its
 			 * gateway monitoring and its rc.linkup hooks all believing every port was
 			 * up for ever.
+			 *
+			 * The speed goes with it, read only when the carrier is up. Asked while a
+			 * port is dark, the ten behind the switch answer with their capability
+			 * rather than with nothing, so a figure read then would be a speed the
+			 * port is not running at.
 			 */
-			npugiu_link_change(n, link);
+			if (link && npunwa_port_get(sc, n, NWA_SUB_SPEED, &v) == 0)
+				p->speed = (int)v;
+			else
+				p->speed = 0;
+			npugiu_link_change(n, link, p->speed);
 		}
 	}
 
