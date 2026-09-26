@@ -126,11 +126,19 @@ Two consequences worth stating plainly:
   unloading has to withdraw from the handshake first, and even that is not airtight because
   there is no acknowledgement to wait for. A reset pulse is the only certain answer.
 
-## The GIU datapath, as far as it has been read
+## The GIU datapath, as far as it had been read
 
-Not implemented here. Recorded because it is the next thing and the reading is done.
+**Implemented, and this section is kept as it was first written.** It is what the disassembly
+said before the vendor's GPL header and the running hardware corrected it, and three of its
+guesses turned out wrong in ways worth leaving visible. [giu.md](giu.md) is the specification
+that was actually built against and [DESIGN.md](../DESIGN.md) has the current state; where the
+two disagree, they do not - this page is the older reading.
 
-One netdev carrying all fourteen front ports, up to 16 Rx and 16 Tx queues. A control block in
+**Not one netdev but fourteen**, npup1..npup14, one per front port. The coprocessor does
+multiplex them onto a single pair of queues, which is where the "one netdev" reading came from,
+but what separates them is a tag rather than an interface - see "The ports" below.
+
+Up to 16 Rx and 16 Tx queues. A control block in
 the BAR whose first byte is a status word - bit 0 target ready, bit 1 host has configured the
 queues, bit 2 target acknowledged - and the interface MAC published at control block + 4.
 
@@ -143,8 +151,14 @@ descriptors with first/middle/last bits. Requests carry a 16-bit index, never 0 
 `0xFFFF`, which the coprocessor echoes in the notification ring so a response can be matched to
 its caller. `0xFFFF` is reserved for coprocessor-initiated events such as link up and down.
 
-Sixteen management opcodes. Named here by what each calling function does - the enum labels are
-not in the binary:
+Sixteen management opcodes. Named here by what each calling function does, because the enum
+labels are not in the binary - **and this table has since been superseded**. Marvell's GPL drop
+carries `giu_nic_hw.h` with the real enum, transcribed into `contrib/npuep/npugiu.h`, and it
+disagrees with three rows below: `0x05` is `CC_PF_INGRESS_TC_ADD` and `0x09` is
+`CC_PF_MGMT_ECHO` - an echo, not a queue configuration - so the "in that call order" note is
+wrong. The lesson is worth more than the table: a function's behaviour read from a disassembly
+names what it does, not what it is called, and the two are not the same thing. Look in the GPL
+drop before inferring an ABI.
 
 | code | function |
 |------|----------|
@@ -159,8 +173,11 @@ not in the binary:
 | `0x1c`, `0x1d` | port and queue rate limit |
 | `0x1e` | get hardware capabilities |
 
-Every command uses a 48-byte request and a 105-byte response except `0x09` and `0x1e`, which
-send no request body - so the whole command ABI is two structures.
+Every command was thought to use a 48-byte request and a 105-byte response except `0x09` and
+`0x1e`. **Also wrong**: request lengths are per command. The bring-up sends 0x10 for `PF_INIT`,
+0x10 for `INGRESS_TC_ADD`, 0x30 for `INGRESS_DATA_Q_ADD`, 0x0c for `EGRESS_TC_ADD` and 0x20 for
+`EGRESS_DATA_Q_ADD`. Responses do share one union, and every one of them spans two descriptors -
+see [giu.md](giu.md).
 
 A minimum viable set for link and traffic: `0x1e`, then `0x09`/`0x01`/`0x05`, then `0x0d`,
 `0x10`, `0x07`.
@@ -171,6 +188,19 @@ protocol is specified in readable C rather than only in one disassembly.
 
 ## The ports
 
-The fourteen front ports arrive on one trunk, separated by **VLAN 4095** subinterfaces. A host
-implementation has to demultiplex them; on Linux the vendor ships a small driver that registers
-a link type for exactly this.
+**This was wrong, and it was the most consequential wrong thing in these notes.** The reading
+said the fourteen front ports arrive on one trunk separated by **VLAN 4095** subinterfaces. They
+are not separated by VLAN at all.
+
+The coprocessor prepends **sixty-six bytes** to every frame in both directions: two bytes of port
+identifier in network order, then sixty-four bytes of metadata. The driver writes that tag on
+transmit to choose the egress port and reads it on receive to decide which interface a frame
+belongs to. There is no VLAN header and no subinterface anywhere in it.
+
+Nor is there one formula for the identifier. Ten ports sit behind an internal switch and carry
+`0x8000 + n*0x100`; four are separate MACs on the SoC and carry `0x0001`..`0x0004`. A host that
+assumes the first family alone cannot address the other four at all - which is exactly what kept
+Port9 to Port12 dark until the two families were separated.
+
+Kept here rather than deleted because the VLAN reading was plausible, held for weeks, and is the
+sort of thing another person working from the same binaries would conclude.

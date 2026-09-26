@@ -2004,11 +2004,12 @@ npugiu_attach(struct npuep_facility *fac)
 		 * seconds instead of four.
 		 */
 		device_printf(fac->dev,
-		    "giu: the device answers HOST_MGMT_READY once per coprocessor boot, so a host "
-		    "reload cannot bring it back.\n");
+		    "giu: the device answers HOST_MGMT_READY once per coprocessor boot, so a "
+		    "module reload on its own cannot bring it back.\n");
 		device_printf(fac->dev,
 		    "giu: PF_CLOSE, retracting the handshake and a thirty-second wait were all "
-		    "measured not to help - power cycle the appliance.\n");
+		    "measured not to help. The coprocessor has to restart, and a cold power "
+		    "cycle is the verified way to get one.\n");
 		goto fail;
 	}
 
