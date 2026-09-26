@@ -37,6 +37,34 @@ Port 8 is behind the coprocessor's internal switch and Port 9 is a separate MAC 
 both port families are proven together. A full ARP exchange completes over either — request in,
 reply out — which is the smallest thing that requires both directions to work.
 
+**Twelve of the fourteen are verified port by port, with loopback cables.** An ARP exchange with
+an outside device proves one path; it says nothing about the other eleven, and nothing at all when
+the far end declines to answer. `contrib/npuep/portmap.sh` removes the far end from the question:
+it transmits out of each port in turn and records which port hears it.
+
+```
+  sent on   heard on
+  npup3      npup4(+1)        0x8300 → 0x8400   switch
+  npup4      npup3(+1)
+  npup5      npup6(+2)        0x8500 → 0x8600   switch
+  npup7      npup8(+1)        0x8700 → 0x8800   switch
+  npup9      npup10(+1)       0x0001 → 0x0003   SoC
+  npup11     npup12(+2)       0x0004 → 0x0002   SoC
+  npup13    - nothing -       SFP cage, no fibre to hand
+```
+
+Every pair symmetric, both tag families, and **the sending port's own counter never moved** — so
+the coprocessor's switch does not forward between front ports behind the host's back. That last
+one is not a detail: if it did, traffic would pass between two ports without `pf` ever seeing it.
+The host is the only forwarder here, which is what a firewall needs.
+
+It also settles the one part of the port table that was inferred rather than read. The four SoC
+ports are tagged `0x0001, 0x0003, 0x0004, 0x0002` in connector order — not sequentially — and that
+ordering came out of a disassembly. If two of those were swapped, a frame leaving `npup10` would
+have arrived on `npup11` instead of `npup9`. It arrived on `npup9`.
+
+`PortF1` and `PortF2` are the SFP cages and are **untested**: a copper patch lead cannot loop them.
+
 The driver loads itself at boot, creates the interfaces, programs the coprocessor and verifies the
 programming by reading it back. Nothing is typed.
 

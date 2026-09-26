@@ -203,6 +203,58 @@ interfaces whose link state, speed and MTU can be read and set** need Sophos's N
 set, which rides the AGNIC custom channel and is not published - it has to be recovered from
 `mv_nwa_host` the way the MCP2210 command map was recovered from `xgs-usb-spi-flash`.
 
+#### Proving the tag table, one port at a time
+
+An ARP exchange with a device on the far end proves one path. It proves nothing about the other
+eleven, and it proves nothing either way when the far end declines to answer - which cost half an
+hour here, pinging a gateway that had been unplugged from that wire hours earlier.
+
+`tcpdump` on the sending interface does not help. That is a BPF tap taken before the frame is
+handed to the coprocessor, so it says the driver transmitted. It cannot say anything came out of
+the connector.
+
+`contrib/npuep/portmap.sh` settles it without a far end at all: transmit out of every port in
+turn, with a loopback cable between pairs, and record which port hears it. Twelve of the fourteen,
+in one sweep:
+
+```
+  npup3 ↔ npup4     0x8300 ↔ 0x8400   switch
+  npup5 ↔ npup6     0x8500 ↔ 0x8600   switch
+  npup7 ↔ npup8     0x8700 ↔ 0x8800   switch
+  npup9 ↔ npup10    0x0001 ↔ 0x0003   SoC
+  npup11 ↔ npup12   0x0004 ↔ 0x0002   SoC
+```
+
+with `npup1 ↔ npup2` measured separately first. Three results come out of it.
+
+**Egress reaches the connector.** Nothing before this had shown that; it was inferred from the
+frame format and from one ARP exchange.
+
+**The SoC tag order is right.** Those four are tagged `0x0001, 0x0003, 0x0004, 0x0002` in
+connector order rather than sequentially, and that ordering was read out of a disassembly, never
+documented. If `0x0002` and `0x0003` were the wrong way round, a frame leaving `npup10` would have
+come out at the connector next to `npup11` and been heard there. It was heard on `npup9`.
+
+**The internal switch does not forward between front ports.** The sending port's own counter never
+moved, in any of the twelve. So every frame crossing between two front ports goes up to the host
+and back down, and `pf` sees all of it. Had the switch forwarded on its own, rules would be
+bypassed by traffic the firewall never saw - which is the kind of thing that is discovered after
+it matters rather than before.
+
+`PortF1` and `PortF2` are the SFP cages and remain **untested**: a copper patch lead cannot loop a
+fibre cage, and no module was to hand.
+
+#### Link state is only reported for the SoC ports
+
+The network agent reports carrier for the four SoC ports and has never once reported it for any of
+the ten switch ports - not while a switch port was demonstrably linked and passing frames, and not
+when a cable was plugged into one. `nwa: 14 of 14 ports up` at attach shows the agent is
+addressing all fourteen for the bring-up command, so this is specific to link state.
+
+The consequence is not cosmetic: `ifconfig` shows no `status:` line for the ten switch ports, so
+OPNsense cannot see a cable being plugged into one, and neither can a human reading the output.
+Open.
+
 ## Why the module is not loaded automatically
 
 It is installed but never loaded by the plugin, and that is deliberate on three counts.
