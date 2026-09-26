@@ -70,7 +70,7 @@ fi
 # that has stopped, and it is worth naming rather than letting every other check fail obscurely.
 db=$(sysctl -n dev.npuep.0.doorbells 2>/dev/null | sed -n '3p')
 case "$db" in
-    *ffffffff*) bad "the endpoint reads all ones - the coprocessor has stopped; it needs a COLD power cycle, not a reboot" ;;
+    *ffffffff*) bad "the endpoint reads all ones - the coprocessor has stopped. Run contrib/npuep/reload.sh; if that does not recover it, power cycle" ;;
     '')         note "could not read the doorbell block" ;;
     *)          ok "the endpoint is answering" ;;
 esac
@@ -86,7 +86,7 @@ else
     bad "no npup interfaces at all"
     # The most common cause, and the one nobody guesses.
     if dmesg | grep -q "answers HOST_MGMT_READY once per coprocessor boot"; then
-        bad "the datapath refused a second bring-up - the coprocessor needs to reboot; a COLD power cycle is the verified way to get one"
+        bad "the datapath refused a second bring-up - the coprocessor has to restart. sh contrib/npuep/reload.sh pulses its reset line and waits for it, which is verified to bring all fourteen back"
     fi
 fi
 

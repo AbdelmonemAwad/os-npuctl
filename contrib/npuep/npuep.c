@@ -256,7 +256,7 @@ npuep_heartbeat(void *arg)
  * handshake into the middle of something else.
  */
 static int
-npuep_read_barmap(struct npuep_softc *sc)
+npuep_read_barmap(struct npuep_softc *sc, int verbose)
 {
 	device_t dev = sc->dev;
 	uint32_t version, cookie;
@@ -274,8 +274,14 @@ npuep_read_barmap(struct npuep_softc *sc)
 		return (ENXIO);
 	}
 	if (cookie != NPU_BARMAP_COOKIE) {
-		device_printf(dev, "NPU barmap not configured (cookie 0x%08x) - "
-		    "the NPU is not running yet\n", cookie);
+		/*
+		 * Quiet unless the caller asked, because the caller polls: a coprocessor
+		 * that was just reset spends about fourteen seconds here, and an ungated
+		 * printf turns that into fourteen identical lines on a 115200 console.
+		 */
+		if (verbose)
+			device_printf(dev, "NPU barmap not configured (cookie 0x%08x) - "
+			    "the NPU is not running yet\n", cookie);
 		return (EAGAIN);
 	}
 	if (version != NPU_BARMAP_VERSION) {
@@ -284,7 +290,8 @@ npuep_read_barmap(struct npuep_softc *sc)
 		return (EINVAL);
 	}
 
-	device_printf(dev, "barmap version %u cookie 0x%08x\n", version, cookie);
+	if (verbose)
+		device_printf(dev, "barmap version %u cookie 0x%08x\n", version, cookie);
 
 	/* struct facility_bar_map { u32 bar; u32 type; u32 offset; u32 size; } */
 	for (i = 0; i < MV_FACILITY_COUNT; i++) {
@@ -294,9 +301,28 @@ npuep_read_barmap(struct npuep_softc *sc)
 		uint32_t off = bar2_read(sc, e + 8);
 		uint32_t size = bar2_read(sc, e + 12);
 
-		device_printf(dev, "  facility %-7s bar%u off 0x%06x size %u\n",
-		    type < MV_FACILITY_COUNT ? npuep_facility_name[type] : "?",
-		    bar == 0 ? 0 : 2, off, size);
+		/*
+		 * An entry the coprocessor has not written yet.
+		 *
+		 * Skip it, because it is not a facility and it is not a claim about one -
+		 * but every field in it is zero, and zero is MV_FACILITY_CONTROL. Read as
+		 * an entry it says the control facility lives on BAR0 with no window, which
+		 * is the one condition below that fails attach outright, so an unwritten
+		 * entry made the driver report the control facility as misplaced.
+		 *
+		 * This is not a hypothetical. The table is filled in entry by entry as the
+		 * coprocessor's firmware comes up, so any load that races its boot - a
+		 * module reload after a reset pulse, which is the normal way to work on this
+		 * driver - lands in the middle of it. The caller waits for the table to be
+		 * finished; this makes a half-written one readable rather than fatal.
+		 */
+		if (bar == 0 && type == 0 && off == 0 && size == 0)
+			continue;
+
+		if (verbose)
+			device_printf(dev, "  facility %-7s bar%u off 0x%06x size %u\n",
+			    type < MV_FACILITY_COUNT ? npuep_facility_name[type] : "?",
+			    bar == 0 ? 0 : 2, off, size);
 
 		/*
 		 * Remember where the management facility lives while the map is in front of
@@ -390,9 +416,93 @@ npuep_read_barmap(struct npuep_softc *sc)
 	}
 
 	if (found < 0) {
-		device_printf(dev, "no control facility in the barmap\n");
-		return (EINVAL);
+		/*
+		 * EAGAIN rather than EINVAL: with unwritten entries skipped above, the way
+		 * to have no control facility is to be reading a table that is not finished.
+		 * The caller treats that as "come back in a second", which is what it is.
+		 */
+		if (verbose)
+			device_printf(dev, "no control facility in the barmap\n");
+		return (EAGAIN);
 	}
+	return (0);
+}
+
+/*
+ * Everything the front ports need. The control facility is not in the list because
+ * npuep_read_barmap cannot return success without it.
+ */
+static int
+npuep_barmap_complete(struct npuep_softc *sc)
+{
+	return (sc->mgmt_off != 0 && sc->giu_size != 0 &&
+	    sc->nwa_size != 0 && sc->rpc_size != 0);
+}
+
+/*
+ * Wait for the coprocessor to finish publishing the facility table.
+ *
+ * The table is not written atomically and the cookie is not a commit: the cookie and the
+ * version are in place long before the five entries are, so a driver that reads the table
+ * as soon as it validates can see three facilities and act on three facilities. That is
+ * exactly what a reload does - `reload.sh` pulses the reset line and loads the module a
+ * second later, and a second is nowhere near long enough for the far side's Linux to come
+ * back up.
+ *
+ * It looks like it works at boot only by accident: `01-npuctl` pulses reset there too, but
+ * a minute of other boot work happens before this module is loaded, and by then the table
+ * is finished. Measured on this board: complete at 60 seconds after the pulse, so the wait
+ * below is twice that and still the difference between fourteen front ports and none.
+ *
+ * Running out of time is not a failure. Waiting is worth doing because the common case is
+ * a coprocessor that is merely slow, but a firmware that genuinely publishes fewer
+ * facilities should get a driver that brings up what it can - the same way attach already
+ * tolerates a management interface that will not come up.
+ */
+#define	NPUEP_BARMAP_WAIT	120
+
+static int
+npuep_wait_barmap(struct npuep_softc *sc)
+{
+	device_t dev = sc->dev;
+	int err, i, said = 0;
+
+	for (i = 0; i <= NPUEP_BARMAP_WAIT; i++) {
+		err = npuep_read_barmap(sc, i == 0);
+		if (err != 0 && err != EAGAIN)
+			return (err);
+
+		if (err == 0 && npuep_barmap_complete(sc)) {
+			if (said)
+				device_printf(dev, "the facility table was complete after "
+				    "%d seconds\n", i);
+			return (0);
+		}
+
+		if (!said) {
+			device_printf(dev, "the coprocessor has not finished publishing its "
+			    "facility table - waiting up to %d seconds for it\n",
+			    NPUEP_BARMAP_WAIT);
+			said = 1;
+		}
+		if (i < NPUEP_BARMAP_WAIT)
+			pause("npubarm", hz);
+	}
+
+	/* Out of time. Read it once more, loudly, and say exactly what is missing. */
+	err = npuep_read_barmap(sc, 1);
+	if (err == EAGAIN) {
+		device_printf(dev, "the coprocessor never published a control facility. "
+		    "It is not running: power cycle it rather than resetting it.\n");
+		return (ENXIO);
+	}
+	if (err != 0)
+		return (err);
+
+	device_printf(dev, "the facility table is still incomplete after %d seconds -%s%s%s%s "
+	    "going on with what was published\n", NPUEP_BARMAP_WAIT,
+	    sc->mgmt_off == 0 ? " no mgmt," : "", sc->giu_size == 0 ? " no giu," : "",
+	    sc->nwa_size == 0 ? " no nwa," : "", sc->rpc_size == 0 ? " no rpc," : "");
 	return (0);
 }
 
@@ -842,6 +952,33 @@ npuep_attach(device_t dev)
 	callout_init_mtx(&sc->heartbeat, &sc->mtx, 0);
 
 	/*
+	 * Is the endpoint actually there, before anything reads its memory?
+	 *
+	 * This costs one config-space read and it prevents a hard hang. A read of a BAR belonging
+	 * to an endpoint whose link is down does not fail and does not time out - it never
+	 * completes, and the host stops. No panic, no console output, nothing: the machine simply
+	 * ceases, and only a power cycle recovers it. That was measured here, at the cost of one,
+	 * after a reset pulse and a forty-five second wait that turned out not to be enough.
+	 *
+	 * Config space is the safe place to ask. A configuration read to a device that is not
+	 * answering is completed by the root complex as an unsupported request and comes back as
+	 * all-ones, so it returns rather than hanging - which is exactly the property the memory
+	 * path does not have.
+	 *
+	 * Refusing here is also correct rather than merely cautious. Every later check in this
+	 * driver - the barmap cookie, the facility cookie, DEV_READY - reads memory, so each of
+	 * them is downstream of the hazard this one removes.
+	 */
+	if (pci_read_config(dev, PCIR_VENDOR, 2) == 0xFFFF) {
+		device_printf(dev,
+		    "the endpoint is not answering config space - it is held in reset or its link "
+		    "is down. Refusing to touch its memory: a read of a BAR in that state hangs "
+		    "the host with no panic and no log.\n");
+		mtx_destroy(&sc->mtx);
+		return (ENXIO);
+	}
+
+	/*
 	 * Bus mastering is needed before the NPU can deliver an MSI-X write, so it cannot be
 	 * left until last - but it is tracked so that detach and every failure path turn it
 	 * off again. Leaving an endpoint bus-mastering with no driver behind it is how this
@@ -913,7 +1050,7 @@ npuep_attach(device_t dev)
 		goto fail;
 	}
 
-	err = npuep_read_barmap(sc);
+	err = npuep_wait_barmap(sc);
 	if (err != 0)
 		goto fail;
 

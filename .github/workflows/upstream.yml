@@ -102,8 +102,10 @@ does not boot - so the appliance comes up with **no front ports and no error tha
 **After updating**
 
 1. \`sh contrib/npuep/build.sh\` on the appliance, then reinstall: \`./install/install.sh\`.
-2. **Cold power cycle.** The datapath attaches once per coprocessor boot, so a rebuilt module is
-   not enough on its own - the coprocessor has to restart. A cold cycle is the verified way.
+2. **Restart the coprocessor.** The datapath attaches once per coprocessor boot, so a rebuilt
+   module is not enough on its own. \`sh contrib/npuep/reload.sh\` pulses its reset line, waits
+   for its facility table and reloads - verified to bring all fourteen ports back without
+   touching the power. A cold power cycle also works if that does not.
 3. \`sh install/verify.sh\` and read every line.
 4. Only when that passes, update \`compat.json\` and close this issue.
 EOF

@@ -71,16 +71,32 @@ its own cannot be answered** — three remedies were tried and measured not to h
 datapath down with `PF_DISABLE`/`PF_CLOSE`, which the device accepts and which changes nothing;
 retracting the stale handshake; and waiting thirty seconds instead of four.
 
-What restores it is a coprocessor reboot. A cold power cycle gives one, and that is verified — the
-boot hook brings everything back with nothing typed. The host can also cause one itself:
-`01-npuctl` pulses the reset line, and that pulse is a real reset rather than a release. Since it
-runs at every boot, a warm reboot probably restores the ports too — **but that has not been
-tested**, and this file previously claimed the opposite without evidence.
+What restores it is a coprocessor reboot, and the host can cause one itself. `01-npuctl` pulses the
+reset line, and that pulse is a real reset rather than a release — so **a pulse followed by a
+reload brings everything back with no power cycle.** Verified, twice in a row: fourteen
+interfaces, the forwarding tables read back and confirmed, `nwa: 14 of 14 ports up`, and a front
+port brought up with no address counted forty frames off the wire in twelve seconds. A cold power
+cycle works too. A warm reboot runs the same hook, so it very probably does as well — still
+untested end to end, but no longer resting on an untested mechanism.
 
-What *is* tested is the hazard: loading the driver too soon after a reset pulse **hangs the host**.
-A PCIe read to an endpoint still in reset neither returns nor times out, so there is no panic and
-no log — the machine simply stops. Nothing here checks that the endpoint is alive before its first
-read, which makes this a risk at every boot and not only in an experiment.
+This file used to say a power cycle was the only way. That was wrong, and both reasons looked like
+hardware rather than like bugs: `reload.sh` parsed the PCI selector with an `awk` field separator
+that left out the tab `pciconf` prints, so it waited its whole timeout and reported a dead
+endpoint that had been answering all along; and the barmap parser read an entry the coprocessor
+had not written yet as a real one — every field zero, and zero is the control facility's id — so a
+half-published table failed attach outright. Both fixed.
+
+**The facility table takes about fourteen seconds to appear after a reset, and is not published
+atomically.** The cookie lands before the entries do, so validating the cookie and reading on gets
+a partial table. The driver now waits for the facilities it actually needs. Measured at exactly
+fourteen seconds on two consecutive cycles.
+
+Loading the driver too soon after a reset pulse **hangs the host**: a PCIe read to an endpoint
+still in reset neither returns nor times out, so there is no panic and no log — the machine simply
+stops. Both the driver and `reload.sh` now ask **config space** first, which is the safe question:
+a configuration read to a device that is not answering comes back as all-ones instead of being
+left outstanding. Measured after the fix, the endpoint answers config space the instant the pulse
+ends, so the guard costs nothing and only the facility table needs waiting for.
 
 **The interfaces are not assigned in OPNsense yet.** They exist, they carry traffic, and they can
 be bridged — but until they are assigned they are outside the firewall's own configuration and pf
